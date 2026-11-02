@@ -1,0 +1,41 @@
+{
+  "task": {
+    "type": "object",
+    "properties": {
+      "summary": {"type": "string", "description": "What you did and why, in a few sentences."},
+      "files_changed": {"type": "array", "items": {"type": "string"}, "description": "Paths you created, edited or deleted, relative to the repo root."},
+      "tests_run": {"type": "array", "items": {"type": "string"}, "description": "Exact test or check commands you ran."},
+      "test_result": {"type": "string", "enum": ["pass", "fail", "not_run"]},
+      "open_questions": {"type": "array", "items": {"type": "string"}, "description": "Anything unresolved, assumed or needing a decision."},
+      "confidence": {"type": "string", "enum": ["low", "medium", "high"]}
+    },
+    "required": ["summary", "files_changed", "tests_run", "test_result", "open_questions", "confidence"],
+    "additionalProperties": false
+  },
+  "review": {
+    "type": "object",
+    "properties": {
+      "verdict": {"type": "string", "enum": ["approve", "request_changes", "inconclusive"]},
+      "summary": {"type": "string"},
+      "findings": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "file": {"type": "string"},
+            "line": {"type": ["integer", "null"]},
+            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+            "claim": {"type": "string", "description": "The defect, in one sentence."},
+            "evidence": {"type": "string", "description": "What you ran or read that shows it: command and output, or quoted code."}
+          },
+          "required": ["file", "line", "severity", "claim", "evidence"],
+          "additionalProperties": false
+        }
+      },
+      "checked": {"type": "array", "items": {"type": "string"}, "description": "Files and commands you actually examined."},
+      "confidence": {"type": "string", "enum": ["low", "medium", "high"]}
+    },
+    "required": ["verdict", "summary", "findings", "checked", "confidence"],
+    "additionalProperties": false
+  }
+}
