@@ -53,6 +53,35 @@ class DocsTest(unittest.TestCase):
         for key in self.server.DEFAULTS:
             self.assertIn("`%s`" % key, text)
 
+    def test_exit_code_table_matches_both_programs(self):
+        with open(os.path.join(REPO, "README.md")) as f:
+            section = f.read().split("## Exit codes", 1)[1].split("\n## ", 1)[0]
+        rows = {}
+        for line in section.splitlines():
+            m = re.match(r"\| (\d) \| ([A-Z]+) \|([^|]*)\|([^|]*)\|$", line)
+            if m:
+                rows[int(m.group(1))] = (m.group(2), m.group(3).strip(), m.group(4).strip())
+        self.assertTrue(rows)
+        self.assertEqual({c: n for c, (n, _, _) in rows.items()}, self.install.EXIT_NAMES)
+        self.assertEqual({c for c, (_, _, srv) in rows.items() if srv}, set(self.server.EXIT_NAMES))
+        for code, name in self.server.EXIT_NAMES.items():
+            self.assertEqual(rows[code][0], name)
+
+    def test_every_make_target_is_documented(self):
+        with open(os.path.join(REPO, "Makefile")) as f:
+            phony = re.search(r"^\.PHONY:(.*)$", f.read(), re.M).group(1).split()
+        with open(os.path.join(REPO, "README.md")) as f:
+            text = f.read()
+        self.assertTrue(phony)
+        for target in phony:
+            if target != "help":
+                self.assertIn("make %s" % target, text)
+
+    def test_example_config_lists_every_key(self):
+        with open(os.path.join(REPO, "config.example.env")) as f:
+            keys = {l.split("=", 1)[0] for l in f if re.match(r"[A-Z_]+=", l)}
+        self.assertEqual(keys, set(self.install.REQUIRED) | set(self.install.OPTIONAL))
+
 
 if __name__ == "__main__":
     unittest.main()
