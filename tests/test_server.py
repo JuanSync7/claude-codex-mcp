@@ -152,6 +152,12 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(r[3]["error"]["code"], -32601)
         self.assertEqual(len(r), 3)  # the notification got no reply
 
+    def test_non_object_request_is_answered_not_fatal(self):
+        p, r = self.session([[1], {"jsonrpc": "2.0", "id": 2, "method": "ping"}])
+        self.assertEqual(r[None]["error"]["code"], -32600)
+        self.assertEqual(r[2]["result"], {})  # the server kept going
+        self.assertEqual(p.returncode, 0)
+
     def test_wrong_host_refuses_to_start(self):
         p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
                             CODEX_MCP_HOST="not-" + socket.gethostname())

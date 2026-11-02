@@ -90,6 +90,7 @@ anything is changed. Each optional key that is left out prints a `[using default
 | `CODEX_MCP_LOG` | no | `~/.local/state/codex-mcp/runs.jsonl` | server | The run log. |
 | `CLAUDE_BIN` | no | `claude` | installer | The Claude Code CLI. |
 | `CLAUDE_CONFIG` | no | `~/.claude.json` | installer | Where Claude Code keeps user-scope MCP entries. It is read to compare against, and never written. |
+| `CLAUDE_MD` | no | `~/.claude/CLAUDE.md` | installer | The instructions file that `make routing` adds the routing rule to. |
 | `LEAKCHECK_WORDS` | no | | leak check | Comma-separated words that must never be committed. |
 
 The server also reads `CODEX_MCP_REPORTS` (the report schemas; by default `reports.json`
