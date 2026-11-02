@@ -29,6 +29,8 @@ FAKE = textwrap.dedent("""\
     if mode == "sleep":
         time.sleep(30)
     print(json.dumps({"type": "thread.started", "thread_id": "t1"}))
+    if os.environ.get("FAKE_NOISE"):
+        print("this is not a JSON event")
     for path, content in json.loads(os.environ.get("FAKE_EDITS", "[]")):
         if content is None:
             os.remove(path)
@@ -118,6 +120,11 @@ class ServerTest(unittest.TestCase):
             body = text
         return res["isError"], body
 
+    def assert_exit_line(self, text, code, name, reason):
+        last = text.rstrip().splitlines()[-1]
+        self.assertTrue(last.startswith("exit: %d %s - " % (code, name)), text)
+        self.assertIn(reason, last)
+
     def fake_saw(self):
         with open(self.log) as f:
             return json.load(f)
@@ -148,9 +155,9 @@ class ServerTest(unittest.TestCase):
     def test_wrong_host_refuses_to_start(self):
         p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
                             CODEX_MCP_HOST="not-" + socket.gethostname())
-        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.returncode, 3)
         self.assertEqual(r, {})
-        self.assertIn("refusing", p.stderr)
+        self.assert_exit_line(p.stderr, 3, "CONFIG", "refusing")
 
     def test_right_host_starts(self):
         p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
@@ -169,10 +176,34 @@ class ServerTest(unittest.TestCase):
     def test_missing_report_schemas_refuses_to_start(self):
         p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
                             CODEX_MCP_REPORTS=os.path.join(self.tmp.name, "nope.json"))
-        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.returncode, 3)
         self.assertEqual(r, {})
+        self.assert_exit_line(p.stderr, 3, "CONFIG", "nope.json")
+
+    def test_bad_settings_refuse_to_start_listing_every_problem(self):
+        p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
+                            CODEX_MCP_TIMEOUT="soon", CODEX_MCP_MAX_PARALLEL="0",
+                            CODEX_MCP_DEFAULT_SANDBOX="danger-full-access")
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertEqual(r, {})
+        self.assertNotIn("Traceback", p.stderr)
+        for key in ("CODEX_MCP_TIMEOUT", "CODEX_MCP_MAX_PARALLEL", "CODEX_MCP_DEFAULT_SANDBOX"):
+            self.assertIn(key, p.stderr)
+        self.assert_exit_line(p.stderr, 3, "CONFIG", "")
+
+    def test_clean_shutdown_prints_exit_line(self):
+        p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+        self.assertEqual(p.returncode, 0)
+        self.assert_exit_line(p.stderr, 0, "OK", "stdin closed")
 
     # --- plain calls ------------------------------------------------------------
+
+    def test_unparsed_codex_output_is_counted_not_dropped(self):
+        err, body = self.call({"prompt": "x", "cwd": self.work}, FAKE_NOISE="1")
+        self.assertFalse(err, body)
+        self.assertEqual(body["run"]["unparsed_lines"], ["this is not a JSON event"])
+        err, body = self.call({"prompt": "x", "cwd": self.work})
+        self.assertEqual(body["run"]["unparsed_lines"], [])
 
     def test_ok_call_uses_default_sandbox_and_cwd(self):
         err, body = self.call({"prompt": "ping", "cwd": self.work})

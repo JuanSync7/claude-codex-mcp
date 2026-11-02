@@ -30,6 +30,9 @@ Config (environment, set in the MCP entry):
     CODEX_MCP_REPORTS          report schemas (default reports.json beside this file)
     CODEX_MCP_LOG              run log (default ~/.local/state/codex-mcp/runs.jsonl;
                                its directory must exist - `make install` makes it)
+
+Exit codes: 0 OK (stdin closed), 1 FAILED (internal error), 3 CONFIG (a setting is wrong;
+every problem is listed). The last line on stderr is always `exit: <code> <name> - <reason>`.
 """
 
 import datetime
@@ -60,12 +63,14 @@ DEFAULTS = {
 def setting(key):
     return os.environ.get(key) or DEFAULTS[key]
 
+EXIT_NAMES = {0: "OK", 1: "FAILED", 3: "CONFIG"}
+
 CODEX_BIN = setting("CODEX_MCP_BIN")
 DEFAULT_SANDBOX = setting("CODEX_MCP_DEFAULT_SANDBOX")
-TIMEOUT = float(setting("CODEX_MCP_TIMEOUT"))
-SLOTS = threading.Semaphore(int(setting("CODEX_MCP_MAX_PARALLEL")))
 REPORTS_PATH = setting("CODEX_MCP_REPORTS")
 LOG_PATH = setting("CODEX_MCP_LOG")
+TIMEOUT = None  # seconds; set and checked in configure()
+SLOTS = None    # semaphore of CODEX_MCP_MAX_PARALLEL; set in configure()
 
 REPORTS = {}  # kind -> JSON schema, loaded in main()
 _out_lock = threading.Lock()
@@ -269,15 +274,20 @@ def run_codex(args):
         if schema_file:
             try:
                 os.remove(schema_file)
-            except OSError:
-                pass
+            except OSError as e:  # harmless to the call, but say so in the server log
+                sys.stderr.write("warning: cannot remove %s: %s\n" % (schema_file, e))
     duration = round(time.monotonic() - t0, 1)
 
-    messages, events_err, commands, usage, thread = [], [], [], None, None
+    messages, events_err, commands, usage, thread, unparsed = [], [], [], None, None, []
     for line in out.splitlines():
         try:
             ev = json.loads(line)
         except ValueError:
+            if line.strip():
+                unparsed.append(line[:500])  # returned, so a format change shows up
+            continue
+        if not isinstance(ev, dict):
+            unparsed.append(line[:500])
             continue
         kind = ev.get("type")
         item = ev.get("item") or {}
@@ -322,7 +332,7 @@ def run_codex(args):
         "mismatch": mismatch,
         "worktree": worktree,
         "run": {"exit": rc, "sandbox": sandbox, "model": model, "thread": thread,
-                "usage": usage, "duration_s": duration},
+                "usage": usage, "duration_s": duration, "unparsed_lines": unparsed},
         "log_error": None,
     }
     body["log_error"] = log_run({
@@ -348,18 +358,32 @@ def handle_call(req_id, params):
     send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
 
-def main():
-    for key in sorted(DEFAULTS):  # stderr: stdout is the protocol channel
-        if not os.environ.get(key):
-            sys.stderr.write("[using default] %s = %s\n" % (key, DEFAULTS[key]))
+def configure():
+    """Check the settings; returns a list of problems (empty when all is well)."""
+    global TIMEOUT, SLOTS
+    problems = []
     want = os.environ.get("CODEX_MCP_HOST")
     if want and want != socket.gethostname():
-        sys.stderr.write("codex-mcp: configured for %s, refusing to start on %s\n"
-                         % (want, socket.gethostname()))
-        return 1
+        problems.append("CODEX_MCP_HOST is %s, refusing to start on %s"
+                        % (want, socket.gethostname()))
     if DEFAULT_SANDBOX not in SANDBOXES:
-        sys.stderr.write("codex-mcp: bad CODEX_MCP_DEFAULT_SANDBOX %r\n" % DEFAULT_SANDBOX)
-        return 1
+        problems.append("CODEX_MCP_DEFAULT_SANDBOX must be one of %s: %r"
+                        % (", ".join(SANDBOXES), DEFAULT_SANDBOX))
+    try:
+        TIMEOUT = float(setting("CODEX_MCP_TIMEOUT"))
+        if TIMEOUT <= 0:
+            raise ValueError
+    except ValueError:
+        problems.append("CODEX_MCP_TIMEOUT must be a positive number of seconds: %r"
+                        % setting("CODEX_MCP_TIMEOUT"))
+    try:
+        slots = int(setting("CODEX_MCP_MAX_PARALLEL"))
+        if slots < 1:
+            raise ValueError
+        SLOTS = threading.Semaphore(slots)
+    except ValueError:
+        problems.append("CODEX_MCP_MAX_PARALLEL must be an integer >= 1: %r"
+                        % setting("CODEX_MCP_MAX_PARALLEL"))
     try:
         with open(REPORTS_PATH) as f:
             REPORTS.update(json.load(f))
@@ -367,8 +391,20 @@ def main():
             if not isinstance(schema.get("required"), list):
                 raise ValueError("schema %r has no required list" % kind)
     except Exception as e:
-        sys.stderr.write("codex-mcp: cannot load report schemas %s: %r\n" % (REPORTS_PATH, e))
-        return 1
+        problems.append("cannot load report schemas %s: %r" % (REPORTS_PATH, e))
+    return problems
+
+
+def serve():
+    """Answer requests until stdin closes; returns (exit code, reason)."""
+    for key in sorted(DEFAULTS):  # stderr: stdout is the protocol channel
+        if not os.environ.get(key):
+            sys.stderr.write("[using default] %s = %s\n" % (key, DEFAULTS[key]))
+    problems = configure()
+    if problems:
+        for p in problems:
+            sys.stderr.write(p + "\n")
+        return 3, "; ".join(problems)
 
     for line in sys.stdin:
         line = line.strip()
@@ -379,6 +415,10 @@ def main():
         except ValueError:
             send({"jsonrpc": "2.0", "id": None,
                   "error": {"code": -32700, "message": "parse error"}})
+            continue
+        if not isinstance(req, dict):
+            send({"jsonrpc": "2.0", "id": None,
+                  "error": {"code": -32600, "message": "request is not a JSON object"}})
             continue
         method, req_id = req.get("method"), req.get("id")
         if req_id is None:  # notification
@@ -400,7 +440,16 @@ def main():
         else:
             send({"jsonrpc": "2.0", "id": req_id,
                   "error": {"code": -32601, "message": "method not found: %s" % method}})
-    return 0
+    return 0, "stdin closed"
+
+
+def main():
+    try:
+        code, why = serve()
+    except Exception as e:  # still end with an exit line, never a bare traceback
+        code, why = 1, "internal error: %r" % (e,)
+    sys.stderr.write("exit: %d %s - %s\n" % (code, EXIT_NAMES[code], why))
+    return code
 
 
 if __name__ == "__main__":
