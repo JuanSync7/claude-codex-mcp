@@ -197,6 +197,42 @@ class ServerTest(unittest.TestCase):
             self.assertIn(key, p.stderr)
         self.assert_exit_line(p.stderr, 3, "CONFIG", "")
 
+    def close_mid_call(self, calls, **env):
+        """Start `calls` sleeping calls, close stdin once codex runs; returns (process, stderr)."""
+        p = subprocess.Popen([sys.executable, SERVER], env=self.env(mode="sleep", **env),
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, universal_newlines=True)
+        for i in range(calls):
+            p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call",
+                                      "params": {"name": "codex", "arguments": {
+                                          "prompt": "x", "cwd": self.work}}}) + "\n")
+        p.stdin.flush()
+        deadline = time.monotonic() + 10
+        while not os.path.exists(self.log):  # the fake writes it as soon as it starts
+            self.assertLess(time.monotonic(), deadline, "codex never started")
+            time.sleep(0.05)
+        p.stdin.close()
+        p.stdin = None  # closed by hand; communicate() must not flush it again
+        _, err = p.communicate(timeout=20)
+        return p, err
+
+    def test_closing_mid_call_cancels_and_logs_it(self):
+        t0 = time.monotonic()
+        p, err = self.close_mid_call(1)
+        self.assertLess(time.monotonic() - t0, 15)  # codex was killed, not waited out
+        self.assertEqual(p.returncode, 1, err)
+        self.assert_exit_line(err, 1, "FAILED", "1 call(s) running; cancelled")
+        runs = self.runs()
+        self.assertEqual(len(runs), 1)
+        self.assertFalse(runs[0]["ok"])
+        self.assertIn("cancelled", runs[0]["error"])
+
+    def test_closing_with_a_call_queued_does_not_start_it(self):
+        p, err = self.close_mid_call(2, CODEX_MCP_MAX_PARALLEL="1")
+        self.assertEqual(p.returncode, 1, err)
+        self.assert_exit_line(err, 1, "FAILED", "2 call(s) running; cancelled")
+        self.assertEqual(len(self.runs()), 1)  # the queued call never ran codex
+
     def test_clean_shutdown_prints_exit_line(self):
         p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
         self.assertEqual(p.returncode, 0)
@@ -377,6 +413,12 @@ class ServerTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.log))
 
     # --- run log ----------------------------------------------------------------
+
+    def test_logged_failure_says_why(self):
+        self.call({"prompt": "x", "cwd": self.work}, mode="fail")
+        self.assertIn("boom", self.runs()[0]["error"])
+        self.call({"prompt": "x", "cwd": self.work})
+        self.assertIsNone(self.runs()[1]["error"])
 
     def test_every_run_is_logged_including_failures(self):
         self.call({"prompt": "first", "cwd": self.work})

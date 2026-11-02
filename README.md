@@ -87,8 +87,8 @@ The usual patterns:
   for you.
 
 Codex's actions bypass Claude Code's hooks and permissions. Every run is therefore
-appended to a JSONL log (mode 0600) with its host, directory, sandbox, outcome, token
-usage and the start of its prompt. Spend is the owner's ChatGPT quota (notional, not
+appended to a JSONL log (mode 0600) with its host, directory, sandbox, outcome and error,
+token usage and the start of its prompt. Spend is the owner's ChatGPT quota (notional, not
 billed).
 
 ## The routing rule
@@ -161,8 +161,8 @@ with that line too, not a traceback.
 
 | Code | Name | Installer (`tools/install.py`) | Server (`codex_mcp/server.py`) |
 |---|---|---|---|
-| 0 | OK | Done, or nothing needed doing. | Claude Code closed its stdin. |
-| 1 | FAILED | The `claude` CLI failed, a read-back did not match, the entry or routing rule is missing or has drifted (`status`), a leak was found, or an unexpected error. | An unexpected error. |
+| 0 | OK | Done, or nothing needed doing. | Claude Code closed its stdin with no call running. |
+| 1 | FAILED | The `claude` CLI failed, a read-back did not match, the entry or routing rule is missing or has drifted (`status`), a leak was found, or an unexpected error. | Claude Code closed its stdin while calls were running: each running Codex is killed and logged as cancelled, a queued call never starts, and the exit line counts them. Or an unexpected error. |
 | 2 | USAGE | Unknown command or option. | |
 | 3 | CONFIG | `config.env` is missing, unreadable or invalid, or a preflight check failed; nothing was changed. | A setting is invalid, or this is not `CODEX_MCP_HOST`. |
 

@@ -31,7 +31,8 @@ Config (environment, set in the MCP entry):
     CODEX_MCP_LOG              run log (default ~/.local/state/codex-mcp/runs.jsonl;
                                its directory must exist - `make install` makes it)
 
-Exit codes: 0 OK (stdin closed), 1 FAILED (internal error), 3 CONFIG (a setting is wrong;
+Exit codes: 0 OK (stdin closed, no call running), 1 FAILED (internal error, or stdin closed
+while calls ran: they are cancelled, logged and counted), 3 CONFIG (a setting is wrong;
 every problem is listed). The last line on stderr is always `exit: <code> <name> - <reason>`.
 """
 
@@ -75,6 +76,26 @@ SLOTS = None    # semaphore of CODEX_MCP_MAX_PARALLEL; set in configure()
 REPORTS = {}  # kind -> JSON schema, loaded in main()
 _out_lock = threading.Lock()
 _log_lock = threading.Lock()
+
+# When stdin closes, calls still in flight are cancelled, not dropped: each running codex
+# is killed, logged as cancelled, and counted in the exit line.
+CANCEL_GRACE = 10       # seconds to wait for cancelled calls to log themselves
+CANCEL = threading.Event()
+_calls = set()          # tools/call threads not yet finished
+_running = {}           # pid -> Popen of codex runs in progress
+_killed = set()         # pids killed by a cancel
+_calls_lock = threading.Lock()
+
+
+def kill_running():
+    """Kill every codex run in progress (called once stdin has closed)."""
+    with _calls_lock:
+        for pid in list(_running):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:  # already exited
+                continue
+            _killed.add(pid)
 
 
 def tool_def():
@@ -257,18 +278,31 @@ def run_codex(args):
     error, out, err, rc = None, "", "", None
     try:
         with SLOTS:
+            if CANCEL.is_set():  # queued behind another call when the client left
+                return tool_result("cancelled before codex started: the client closed "
+                                   "the connection", True)
             try:
                 proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdin=subprocess.DEVNULL,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         universal_newlines=True, start_new_session=True)
             except OSError as e:
                 return tool_result("could not start codex (%s): %s" % (CODEX_BIN, e), True)
+            with _calls_lock:
+                _running[proc.pid] = proc
+            if CANCEL.is_set():  # the cancel ran between the check above and now
+                kill_running()
             try:
                 out, err = proc.communicate(timeout=TIMEOUT)
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
                 out, err = proc.communicate()
                 error = "codex timed out after %gs" % TIMEOUT
+            finally:
+                with _calls_lock:
+                    _running.pop(proc.pid, None)
+                    cancelled = proc.pid in _killed
+            if cancelled:
+                error = "cancelled mid-run: the client closed the connection"
             rc = proc.returncode
     finally:
         if schema_file:
@@ -339,6 +373,7 @@ def run_codex(args):
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "host": socket.gethostname(), "cwd": cwd, "worktree": worktree, "sandbox": sandbox,
         "model": model, "report": report_kind, "ok": body["ok"], "exit": rc,
+        "error": error and error[:300],
         "duration_s": duration, "usage": usage, "spend": "chatgpt-quota (notional)",
         "commands": len(commands), "files_changed": None if files is None else len(files),
         "prompt_head": prompt[:200],
@@ -355,7 +390,13 @@ def handle_call(req_id, params):
         result = run_codex(params.get("arguments") or {})
     except Exception as e:  # report, never leave the call hanging
         result = tool_result("internal error: %r" % (e,), True)
-    send({"jsonrpc": "2.0", "id": req_id, "result": result})
+    try:
+        send({"jsonrpc": "2.0", "id": req_id, "result": result})
+    except (OSError, ValueError) as e:  # client gone; the run is already in the log
+        sys.stderr.write("cannot send result of call %r: %s\n" % (req_id, e))
+    finally:
+        with _calls_lock:
+            _calls.discard(threading.current_thread())
 
 
 def configure():
@@ -435,12 +476,33 @@ def serve():
         elif method == "tools/list":
             send({"jsonrpc": "2.0", "id": req_id, "result": {"tools": [tool_def()]}})
         elif method == "tools/call":
-            threading.Thread(target=handle_call, args=(req_id, req.get("params") or {}),
-                             daemon=True).start()
+            t = threading.Thread(target=handle_call, args=(req_id, req.get("params") or {}),
+                                 daemon=True)
+            with _calls_lock:
+                _calls.add(t)
+            t.start()
         else:
             send({"jsonrpc": "2.0", "id": req_id,
                   "error": {"code": -32601, "message": "method not found: %s" % method}})
-    return 0, "stdin closed"
+    return finish_calls()
+
+
+def finish_calls():
+    """stdin has closed: cancel calls still in flight; returns (exit code, reason)."""
+    with _calls_lock:
+        pending = list(_calls)
+    if not pending:
+        return 0, "stdin closed"
+    CANCEL.set()
+    kill_running()
+    deadline = time.monotonic() + CANCEL_GRACE
+    for t in pending:
+        t.join(max(0, deadline - time.monotonic()))
+    stuck = sum(t.is_alive() for t in pending)
+    why = "stdin closed with %d call(s) running; cancelled them" % len(pending)
+    if stuck:
+        why += ", %d did not finish within %ds and may be unlogged" % (stuck, CANCEL_GRACE)
+    return 1, why
 
 
 def main():
