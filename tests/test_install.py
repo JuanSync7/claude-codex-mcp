@@ -291,19 +291,28 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.entry()["env"]["CODEX_MCP_TIMEOUT"], "1800")
 
     def test_all_missing_keys_listed_in_one_run(self):
-        self.write_config(CODEX_MCP_BIN=None, CODEX_MCP_HOST=None)
+        self.write_config(CODEX_MCP_BIN=None, CODEX_MCP_PYTHON=None)
         code, out = self.run_install("install")
         self.assertEqual(code, 3, out)
         self.assert_exit_line(out, 3, "CONFIG")
         self.assertIn("[not set] CODEX_MCP_BIN", out)
-        self.assertIn("[not set] CODEX_MCP_HOST", out)
+        self.assertIn("[not set] CODEX_MCP_PYTHON", out)
         self.assertEqual(self.calls(), [])
 
     def test_empty_value_counts_as_not_set(self):
-        self.write_config(CODEX_MCP_HOST="")
+        self.write_config(CODEX_MCP_BIN="")
         code, out = self.run_install("install")
         self.assertEqual(code, 3, out)
-        self.assertIn("[not set] CODEX_MCP_HOST", out)
+        self.assertIn("[not set] CODEX_MCP_BIN", out)
+
+    def test_host_left_out_gates_to_this_host(self):
+        for value in (None, "", "$(hostname)"):  # left out, empty, or as in the example
+            self.write_config(CODEX_MCP_HOST=value)
+            code, out = self.run_install("install")
+            self.assertEqual(code, 0, out)
+            self.assertIn("[using default] CODEX_MCP_HOST = %s (this host)"
+                          % socket.gethostname(), out)
+            self.assertEqual(self.entry()["env"]["CODEX_MCP_HOST"], socket.gethostname())
 
     def test_unknown_key_refused(self):
         with open(self.config, "a") as f:

@@ -43,7 +43,9 @@ class DocsTest(unittest.TestCase):
 
     def test_server_defaults_match_installer_defaults(self):
         for key in self.install.SERVER_KEYS:
-            if key in self.install.OPTIONAL:
+            # the host has no server default: unset there means no gate, and the
+            # installer always writes one into the entry
+            if key in self.install.OPTIONAL and key != "CODEX_MCP_HOST":
                 self.assertEqual(self.server.DEFAULTS[key],
                                  os.path.expanduser(self.install.OPTIONAL[key]), key)
 

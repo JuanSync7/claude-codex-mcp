@@ -22,16 +22,16 @@ You need:
 Then, in a clone of this repo:
 
 ```sh
-cp config.example.env config.env   # 1. set the three required values (see Config)
+cp config.example.env config.env   # 1. set the two required values (see Config)
 make verify                        # 2. tests + leak check; exit 0 expected
 make routing                       # 3. add the rule that tells Claude when to use Codex
 make install                       # 4. check everything, then register the "codex" server
 make status                        # 5. exit 0: the entry and the rule match config.env
 ```
 
-The three required values are the Python that runs the server (`CODEX_MCP_PYTHON`), the
-absolute path of `codex` (`CODEX_MCP_BIN`, from `command -v codex`) and this host's name
-(`CODEX_MCP_HOST`, from `hostname`).
+The two required values are the Python that runs the server (`CODEX_MCP_PYTHON`) and the
+absolute path of `codex` (`CODEX_MCP_BIN`, from `command -v codex`). The server is gated
+to the host you install on (`CODEX_MCP_HOST`, by default the output of `hostname`).
 
 Then restart Claude Code: it reads MCP servers at start-up. In a new session, `/mcp`
 lists `codex` as connected. The first call asks for permission like any other tool; you
@@ -130,7 +130,7 @@ anything is changed. Each optional key that is left out prints a `[using default
 |---|---|---|---|---|
 | `CODEX_MCP_PYTHON` | yes | | make, installer | Python 3 that runs the server and the tools. |
 | `CODEX_MCP_BIN` | yes | | server | The `codex` executable. Its directory also goes first on `PATH`, so Codex finds its `node`. |
-| `CODEX_MCP_HOST` | yes | | server | The only host name the server starts on. |
+| `CODEX_MCP_HOST` | no | `$(hostname)` | server | The only host name the server starts on. Left out, it is the host `make install` runs on, so the gate is always on. |
 | `CODEX_MCP_DEFAULT_SANDBOX` | no | `read-only` | server | The sandbox used when a call does not choose one. |
 | `CODEX_MCP_TIMEOUT` | no | `1800` | server | Seconds per call. After that, Codex's process group is killed. |
 | `CODEX_MCP_MAX_PARALLEL` | no | `2` | server | Codex runs at once. Further calls wait. |

@@ -37,8 +37,10 @@ NAME = "codex"  # the MCP server name; Claude exposes the tool as mcp__codex__co
 SANDBOXES = ("read-only", "workspace-write")
 EXIT_NAMES = {0: "OK", 1: "FAILED", 2: "USAGE", 3: "CONFIG"}
 
-REQUIRED = ("CODEX_MCP_PYTHON", "CODEX_MCP_BIN", "CODEX_MCP_HOST")
+THIS_HOST = "$(hostname)"  # default resolved when config is loaded, on the installing host
+REQUIRED = ("CODEX_MCP_PYTHON", "CODEX_MCP_BIN")
 OPTIONAL = {
+    "CODEX_MCP_HOST": THIS_HOST,
     "CODEX_MCP_DEFAULT_SANDBOX": "read-only",
     "CODEX_MCP_TIMEOUT": "1800",
     "CODEX_MCP_MAX_PARALLEL": "2",
@@ -100,8 +102,11 @@ def load_config(path):
         else:
             problems.append("[not set] %s" % key)
     for key, default in OPTIONAL.items():
-        if raw.get(key):
+        if raw.get(key) and raw[key] != THIS_HOST:  # the example's literal means the default
             cfg[key] = raw[key]
+        elif default == THIS_HOST:
+            cfg[key] = socket.gethostname()
+            say("[using default] %s = %s (this host)" % (key, cfg[key]))
         else:
             cfg[key] = default
             say("[using default] %s = %s" % (key, default))
@@ -131,7 +136,7 @@ def load_config(path):
                         % cfg["CODEX_MCP_MAX_PARALLEL"])
     if not os.path.isabs(cfg["CODEX_MCP_LOG"]):
         problems.append("CODEX_MCP_LOG must be an absolute path: %r" % cfg["CODEX_MCP_LOG"])
-    if "CODEX_MCP_HOST" in cfg and cfg["CODEX_MCP_HOST"] != socket.gethostname():
+    if cfg["CODEX_MCP_HOST"] != socket.gethostname():
         problems.append("CODEX_MCP_HOST is %r but this host is %r - the server would refuse "
                         "to start; set it to the output of `hostname`"
                         % (cfg["CODEX_MCP_HOST"], socket.gethostname()))
