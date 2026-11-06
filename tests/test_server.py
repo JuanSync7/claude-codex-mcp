@@ -20,6 +20,14 @@ FAKE = textwrap.dedent("""\
     #!%s
     import json, os, sys, time
     argv = sys.argv[1:]
+    if argv[:1] == ["sandbox"]:  # the wrapper asks where a shell in the sandbox starts
+        with open(os.environ["FAKE_LOG"] + ".sandbox", "w") as f:
+            f.write(json.dumps({"argv": argv, "cwd": os.getcwd(), "pid": os.getpid()}))
+        time.sleep(float(os.environ.get("FAKE_SANDBOX_SLEEP", "0")))
+        if os.environ.get("FAKE_SANDBOX_FAIL"):
+            sys.stderr.write("no sandbox\\n"); sys.exit(1)
+        print(os.environ.get("FAKE_SANDBOX_PWD") or os.getcwd())
+        sys.exit(0)
     schema = None
     if "--output-schema" in argv:
         schema = json.load(open(argv[argv.index("--output-schema") + 1]))
@@ -46,6 +54,9 @@ FAKE = textwrap.dedent("""\
     if mode in ("fail", "msgfail"):
         sys.stderr.write("boom\\n"); sys.exit(3)
     """) % sys.executable
+
+REVIEW = {"verdict": "approve", "summary": "fine", "findings": [], "checked": ["a.txt"],
+          "confidence": "medium"}
 
 TASK_REPORT = {"summary": "did it", "files_changed": ["a.txt", "ghost.txt"],
                "tests_run": ["make test"], "test_result": "pass",
@@ -197,23 +208,25 @@ class ServerTest(unittest.TestCase):
             self.assertIn(key, p.stderr)
         self.assert_exit_line(p.stderr, 3, "CONFIG", "")
 
-    def close_mid_call(self, calls, **env):
-        """Start `calls` sleeping calls, close stdin once codex runs; returns (process, stderr)."""
+    def close_mid_call(self, calls, started=None, args=None, **env):
+        """Start `calls` sleeping calls, close stdin once `started` exists (by default, once
+        codex runs); returns (process, stderr)."""
+        started = started or self.log
+        args = dict({"prompt": "x", "cwd": self.work}, **(args or {}))
         p = subprocess.Popen([sys.executable, SERVER], env=self.env(mode="sleep", **env),
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, universal_newlines=True)
         for i in range(calls):
             p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": i + 1, "method": "tools/call",
-                                      "params": {"name": "codex", "arguments": {
-                                          "prompt": "x", "cwd": self.work}}}) + "\n")
+                                      "params": {"name": "codex", "arguments": args}}) + "\n")
         p.stdin.flush()
         deadline = time.monotonic() + 10
-        while not os.path.exists(self.log):  # the fake writes it as soon as it starts
+        while not os.path.exists(started):  # the fake writes it as soon as it starts
             self.assertLess(time.monotonic(), deadline, "codex never started")
             time.sleep(0.05)
         p.stdin.close()
         p.stdin = None  # closed by hand; communicate() must not flush it again
-        _, err = p.communicate(timeout=20)
+        self.last_out, err = p.communicate(timeout=20)
         return p, err
 
     def test_closing_mid_call_cancels_and_logs_it(self):
@@ -353,12 +366,35 @@ class ServerTest(unittest.TestCase):
     def test_review_report_uses_review_schema(self):
         review = {"verdict": "approve", "summary": "fine", "findings": [],
                   "checked": ["a.txt"], "confidence": "medium"}
-        err, body = self.call({"prompt": "x", "cwd": self.work, "report": "review"},
-                              FAKE_MESSAGE=json.dumps(review))
+        err, body = self.call({"prompt": "x", "cwd": self.work, "report": "review",
+                               "sandbox": "read-only"}, FAKE_MESSAGE=json.dumps(review))
         self.assertFalse(err, body)
         self.assertEqual(body["report"], review)
         self.assertIn("verdict", self.fake_saw()["schema"]["required"])
         self.assertIsNone(body["mismatch"])  # nothing to cross-check without files_changed
+
+    def test_review_that_changes_files_is_void(self):
+        repo = self.make_repo()
+        err, body = self.call({"prompt": "x", "cwd": repo, "report": "review"},
+                              FAKE_EDITS=[["a.txt", "fixed while judging"]],
+                              FAKE_MESSAGE=json.dumps(REVIEW))
+        self.assertTrue(err)
+        self.assertIn("review void", body["error"])
+        self.assertEqual(body["observed"]["files_changed"], ["a.txt"])
+        self.assertFalse(self.runs()[0]["ok"])
+
+    def test_review_in_git_that_changes_nothing_is_kept(self):
+        repo = self.make_repo()
+        err, body = self.call({"prompt": "x", "cwd": repo, "report": "review"},
+                              FAKE_MESSAGE=json.dumps(REVIEW))
+        self.assertFalse(err, body)
+        self.assertEqual(body["report"], REVIEW)
+
+    def test_writable_review_with_unknown_files_is_void(self):
+        err, body = self.call({"prompt": "x", "cwd": self.work, "report": "review"},
+                              FAKE_MESSAGE=json.dumps(REVIEW))
+        self.assertTrue(err)  # outside git a write could not be seen, so it is not ruled out
+        self.assertIn("review void", body["error"])
 
     def test_report_that_is_not_json_is_error(self):
         err, body = self.call({"prompt": "x", "cwd": self.work, "report": "task"},
@@ -411,6 +447,68 @@ class ServerTest(unittest.TestCase):
         err, _ = self.call({"prompt": "x", "cwd": self.work, "worktree": True})
         self.assertTrue(err)
         self.assertFalse(os.path.exists(self.log))
+
+    # --- sandbox visibility -----------------------------------------------------
+
+    def test_sandbox_is_asked_where_it_starts_in_the_run_folder(self):
+        err, body = self.call({"prompt": "x", "cwd": self.work, "sandbox": "read-only"})
+        self.assertFalse(err, body)
+        with open(self.log + ".sandbox") as f:
+            saw = json.load(f)
+        self.assertIn('sandbox_mode="read-only"', saw["argv"])
+        self.assertEqual(os.path.realpath(saw["cwd"]), os.path.realpath(self.work))
+
+    def test_cwd_the_sandbox_hides_is_refused_without_running(self):
+        err, body = self.call({"prompt": "x", "cwd": self.work},
+                              FAKE_SANDBOX_PWD=self.tmp.name)  # it would start elsewhere
+        self.assertTrue(err)
+        self.assertIn("not visible inside the workspace-write sandbox", body)
+        self.assertIn(os.path.realpath(self.tmp.name), body)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertFalse(os.path.exists(self.runlog))
+
+    def test_sandbox_check_that_fails_refuses(self):
+        err, body = self.call({"prompt": "x", "cwd": self.work}, FAKE_SANDBOX_FAIL="1")
+        self.assertTrue(err)
+        self.assertIn("no sandbox", body)
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_hidden_worktree_is_removed_not_left_behind(self):
+        repo = self.make_repo()
+        err, body = self.call({"prompt": "x", "cwd": repo, "worktree": True},
+                              FAKE_SANDBOX_PWD=self.tmp.name)
+        self.assertTrue(err)
+        self.assertFalse(os.path.exists(self.log))
+        self.assertEqual(len([l for l in git(repo, "worktree", "list", "--porcelain")
+                              .splitlines() if l.startswith("worktree ")]), 1)
+        self.assertEqual(git(repo, "branch", "--list", "codex/*"), "")
+
+    def test_closing_during_the_sandbox_check_kills_it_and_removes_the_worktree(self):
+        repo = self.make_repo()
+        t0 = time.monotonic()
+        p, err = self.close_mid_call(1, started=self.log + ".sandbox",
+                                     args={"cwd": repo, "worktree": True},
+                                     FAKE_SANDBOX_SLEEP="30")
+        self.assertLess(time.monotonic() - t0, 15)  # the check was killed, not waited out
+        self.assert_exit_line(err, 1, "FAILED", "1 call(s) running; cancelled")
+        self.assertNotIn("did not finish", err)
+        self.assertIn("cancelled before codex started", self.last_out)
+        with open(self.log + ".sandbox") as f:
+            pid = json.load(f)["pid"]
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertFalse(os.path.exists(self.log))  # codex exec never ran
+        self.assertFalse(os.path.exists(self.runlog))
+        self.assertEqual(len([l for l in git(repo, "worktree", "list", "--porcelain")
+                              .splitlines() if l.startswith("worktree ")]), 1)
+        self.assertEqual(git(repo, "branch", "--list", "codex/*"), "")
+
+    def test_folder_name_with_edge_spaces_is_matched_exactly(self):
+        work = os.path.join(self.tmp.name, " work ")
+        os.mkdir(work)
+        err, body = self.call({"prompt": "x", "cwd": work})
+        self.assertFalse(err, body)
+        self.assertEqual(self.fake_saw()["cwd"], work)
 
     # --- run log ----------------------------------------------------------------
 

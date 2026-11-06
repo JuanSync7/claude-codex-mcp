@@ -109,7 +109,9 @@ def tool_def():
             "`mismatch`. sandbox=workspace-write lets it edit files under cwd; worktree=true "
             "runs it in a fresh git worktree off HEAD (uncommitted main-tree changes are not "
             "in it) and returns its path and branch for you to review and merge. "
-            "report=task|review makes it answer in a fixed JSON shape. Each call is "
+            "report=task|review makes it answer in a fixed JSON shape. A cwd the sandbox "
+            "cannot see is refused before Codex runs, and a review that changed files (or "
+            "could have, unseen) is void. Each call is "
             "independent (no memory), so put all needed context in the prompt. Uses the "
             "owner's Codex quota."
         ),
@@ -196,6 +198,73 @@ def make_worktree(cwd):
     return {"path": path, "branch": branch, "base": base}, run_dir
 
 
+def run_tracked(cmd, cwd, env):
+    """Run cmd in its own process group where a cancel can kill it.
+
+    Returns (returncode, stdout, stderr, why): why is "timeout", "cancelled" or None.
+    Raises OSError when cmd cannot start.
+    """
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            universal_newlines=True, start_new_session=True)
+    with _calls_lock:
+        _running[proc.pid] = proc
+    if CANCEL.is_set():  # the cancel ran before the process was registered
+        kill_running()
+    why = None
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, err = proc.communicate()
+        why = "timeout"
+    finally:
+        with _calls_lock:
+            _running.pop(proc.pid, None)
+            if proc.pid in _killed:
+                why = "cancelled"
+    return proc.returncode, out, err, why
+
+
+def remove_worktree(cwd, worktree):
+    """Undo make_worktree for a run that never started; returns an error string, or None."""
+    top = (git(cwd, "rev-parse", "--show-toplevel") or "").strip()
+    for args in (["worktree", "remove", "--force", worktree["path"]],
+                 ["branch", "-D", worktree["branch"]]):
+        p = subprocess.run(["git", "-C", top] + args, stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True)
+        if p.returncode != 0:
+            return "git %s failed: %s" % (" ".join(args[:2]), p.stderr.strip())
+    return None
+
+
+def sandbox_start(sandbox, run_dir, env):
+    """(folder, error): where a shell inside the sandbox starts when Codex runs in run_dir.
+
+    A sandbox that cannot see run_dir (read-only mounts a private, empty /dev/shm) starts
+    Codex in the home folder instead, with no error, so it would judge the wrong tree.
+    """
+    cmd = [CODEX_BIN, "sandbox", "-c", 'sandbox_mode="%s"' % sandbox, "--",
+           "/bin/sh", "-c", "pwd"]
+    try:
+        rc, out, err, why = run_tracked(cmd, run_dir, env)
+    except OSError as e:
+        return None, "could not check the sandbox (%s): %s" % (CODEX_BIN, e)
+    if why == "cancelled":
+        return None, "cancelled before codex started: the client closed the connection"
+    if why == "timeout":
+        return None, "could not check the sandbox: codex sandbox timed out after %gs" % TIMEOUT
+    if rc != 0:
+        return None, "could not check the sandbox: codex sandbox exited %d: %s" % (
+            rc, err.strip() or "(no stderr)")
+    # pwd prints the folder and one newline; strip() would also eat spaces in its name
+    folder = out[:-1] if out.endswith("\n") else None
+    if not folder or "\n" in folder:
+        return None, "could not check the sandbox: expected one folder, got %r" % out
+    return folder, None
+
+
 def check_report(kind, text):
     """(report, error) - the parsed report, or why it is not one."""
     try:
@@ -247,6 +316,24 @@ def run_codex(args):
         except (ValueError, RuntimeError) as e:
             return tool_result(str(e), True)
 
+    env = dict(os.environ)
+    bindir = os.path.dirname(CODEX_BIN)
+    if bindir:
+        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+
+    start, error = sandbox_start(sandbox, run_dir, env)
+    if error is None and os.path.realpath(start) != os.path.realpath(run_dir):
+        error = ("cwd is not visible inside the %s sandbox: a shell there starts in %s, not %s, "
+                 "so Codex would work on the wrong folder. Use a folder the sandbox shows, "
+                 "or workspace-write, which mounts cwd." % (sandbox, os.path.realpath(start),
+                                                            run_dir))
+    if error is not None:
+        if worktree:
+            cleanup = remove_worktree(cwd, worktree)
+            if cleanup:
+                error += "; the new worktree %s is left behind: %s" % (worktree["path"], cleanup)
+        return tool_result(error, True)
+
     top = git(run_dir, "rev-parse", "--show-toplevel")
     top = top.strip() if top else None
     if top is None:
@@ -269,11 +356,6 @@ def run_codex(args):
         cmd += ["--output-schema", schema_file]
     cmd += ["--", prompt]
 
-    env = dict(os.environ)
-    bindir = os.path.dirname(CODEX_BIN)
-    if bindir:
-        env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
-
     t0 = time.monotonic()
     error, out, err, rc = None, "", "", None
     try:
@@ -282,28 +364,13 @@ def run_codex(args):
                 return tool_result("cancelled before codex started: the client closed "
                                    "the connection", True)
             try:
-                proc = subprocess.Popen(cmd, cwd=run_dir, env=env, stdin=subprocess.DEVNULL,
-                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                        universal_newlines=True, start_new_session=True)
+                rc, out, err, why = run_tracked(cmd, run_dir, env)
             except OSError as e:
                 return tool_result("could not start codex (%s): %s" % (CODEX_BIN, e), True)
-            with _calls_lock:
-                _running[proc.pid] = proc
-            if CANCEL.is_set():  # the cancel ran between the check above and now
-                kill_running()
-            try:
-                out, err = proc.communicate(timeout=TIMEOUT)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                out, err = proc.communicate()
-                error = "codex timed out after %gs" % TIMEOUT
-            finally:
-                with _calls_lock:
-                    _running.pop(proc.pid, None)
-                    cancelled = proc.pid in _killed
-            if cancelled:
+            if why == "cancelled":
                 error = "cancelled mid-run: the client closed the connection"
-            rc = proc.returncode
+            elif why == "timeout":
+                error = "codex timed out after %gs" % TIMEOUT
     finally:
         if schema_file:
             try:
@@ -356,6 +423,15 @@ def run_codex(args):
         claimed = set(report["files_changed"])
         mismatch = {"claimed_not_observed": sorted(claimed - set(files)),
                     "observed_not_claimed": sorted(set(files) - claimed)}
+
+    # A reviewer that edits what it judges, or could have without being seen, gives no verdict.
+    if error is None and report_kind == "review":
+        if files:
+            error = ("review void: %d file(s) changed during the review, listed in "
+                     "observed.files_changed (%s)" % (len(files), basis))
+        elif files is None and sandbox != "read-only":
+            error = ("review void: the %s sandbox could write and the files changed are "
+                     "unknown (%s)" % (sandbox, basis))
 
     body = {
         "ok": error is None,

@@ -68,7 +68,7 @@ The result is one JSON object:
 
 | Field | Meaning |
 |---|---|
-| `ok`, `error` | `ok` is false when Codex failed, timed out, gave no final message, or a requested report did not match its schema; `error` says which. |
+| `ok`, `error` | `ok` is false when Codex failed, timed out, gave no final message, or a requested report did not match its schema, and when a review is void (below); `error` says which. |
 | `message`, `report` | Codex's final message, and the parsed report when one was asked for. |
 | `observed.commands` | Every shell command Codex ran, with its exit code. |
 | `observed.files_changed` | Files that differ in a git snapshot taken before and after the run. Codex edits through shell commands, which emit no file-change event, so the snapshot is the evidence. Outside a git repo this is `null` (unknown), never `[]`. |
@@ -79,12 +79,23 @@ The result is one JSON object:
 
 The usual patterns:
 
-- **Review:** `report: "review"`, `sandbox: "read-only"`. You get a verdict and findings,
-  each with the evidence Codex says it used.
+- **Review:** `report: "review"`, `sandbox: "read-only"` where the sandbox can see `cwd`,
+  else `workspace-write`. You get a verdict and findings, each with the evidence Codex says
+  it used. The review is void (`ok` false) when the snapshot shows a file changed during
+  it, or when it could write and the files changed are unknown (outside git). A reviewer
+  that edits what it judges gives no verdict.
 - **Task:** `worktree: true`, `report: "task"`. Check `observed` and `mismatch`, run the
   tests yourself, and review the diff in the worktree. Then merge or discard, and remove
   it (`git worktree remove <path>`, `git branch -D <branch>`). Worktrees are not removed
   for you.
+
+Before Codex starts, the server runs `codex sandbox` with the call's sandbox in the run
+folder and asks a shell there where it starts. A sandbox that cannot see the folder starts
+Codex in the home folder, with no error: the read-only sandbox, for one, mounts a private,
+empty `/dev/shm`. When the shell does not start in the run folder, the call is refused
+before Codex runs (no quota spent, nothing logged), and a worktree made for it is removed.
+The check runs like Codex itself: a client that disconnects during it kills it, and the
+worktree is removed then too.
 
 Codex's actions bypass Claude Code's hooks and permissions. Every run is therefore
 appended to a JSONL log (mode 0600) with its host, directory, sandbox, outcome and error,
