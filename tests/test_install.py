@@ -290,6 +290,20 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn("[using default] CODEX_MCP_MAX_PARALLEL", out)
         self.assertEqual(self.entry()["env"]["CODEX_MCP_TIMEOUT"], "1800")
 
+    def test_max_parallel_none_is_accepted_and_registered(self):
+        self.write_config(CODEX_MCP_MAX_PARALLEL="none")
+        code, out = self.run_install("install")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.entry()["env"]["CODEX_MCP_MAX_PARALLEL"], "none")
+
+    def test_max_parallel_other_word_refused_before_the_server_starts(self):
+        # the server's own check would refuse it too; this proves the installer's
+        self.write_config(CODEX_MCP_MAX_PARALLEL="unlimited")
+        code, out = self.run_install("install")
+        self.assertEqual(code, 3, out)
+        self.assertIn("CODEX_MCP_MAX_PARALLEL", out)
+        self.assertNotIn("the server does not start", out)
+
     def test_all_missing_keys_listed_in_one_run(self):
         self.write_config(CODEX_MCP_BIN=None, CODEX_MCP_PYTHON=None)
         code, out = self.run_install("install")
@@ -325,6 +339,7 @@ class InstallTest(unittest.TestCase):
     def test_bad_values_refused(self):
         for key, value in [("CODEX_MCP_DEFAULT_SANDBOX", "danger-full-access"),
                            ("CODEX_MCP_TIMEOUT", "soon"), ("CODEX_MCP_MAX_PARALLEL", "0"),
+                           ("CODEX_MCP_MAX_PARALLEL", "unlimited"),
                            ("CODEX_MCP_BIN", os.path.join(self.tmp.name, "missing")),
                            ("CLAUDE_BIN", os.path.join(self.tmp.name, "missing"))]:
             with self.subTest(key=key):

@@ -614,5 +614,43 @@ class PreStartTest(unittest.TestCase):
         self.assertEqual(self.worktrees(), (2, 1))  # what it may have changed is kept
 
 
+class SlotsTest(unittest.TestCase):
+    """CODEX_MCP_MAX_PARALLEL: a number caps concurrent Codex runs; `none` means no cap."""
+
+    def configure(self, value):
+        spec = importlib.util.spec_from_file_location("server_slots", SERVER)
+        server = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(server)
+        with mock.patch.dict(os.environ, CODEX_MCP_MAX_PARALLEL=value):
+            problems = server.configure()
+        return server.SLOTS, [p for p in problems if "CODEX_MCP_MAX_PARALLEL" in p]
+
+    def test_none_lets_every_call_run_at_once(self):
+        slots, problems = self.configure("none")
+        self.assertEqual(problems, [])
+        held = []
+
+        def hold_many():  # in a thread, so a cap shows as a timeout, not a hung suite
+            for _ in range(50):
+                slots.__enter__()
+                held.append(1)
+
+        t = threading.Thread(target=hold_many, daemon=True)
+        t.start()
+        t.join(5)
+        self.assertEqual(len(held), 50)
+
+    def test_a_number_still_caps(self):
+        slots, problems = self.configure("2")
+        self.assertEqual(problems, [])
+        self.assertTrue(slots.acquire(timeout=1) and slots.acquire(timeout=1))
+        self.assertFalse(slots.acquire(timeout=0.1))
+
+    def test_other_words_are_refused(self):
+        for value in ("0", "-1", "unlimited", "None"):
+            with self.subTest(value=value):
+                self.assertEqual(len(self.configure(value)[1]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

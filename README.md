@@ -147,7 +147,7 @@ anything is changed. Each optional key that is left out prints a `[using default
 | `CODEX_MCP_HOST` | no | `$(hostname)` | server | The only host name the server starts on. Left out, it is the host `make install` runs on, so the gate is always on. |
 | `CODEX_MCP_DEFAULT_SANDBOX` | no | `read-only` | server | The sandbox used when a call does not choose one. |
 | `CODEX_MCP_TIMEOUT` | no | `1800` | server | Seconds per call. After that, Codex's process group is killed. |
-| `CODEX_MCP_MAX_PARALLEL` | no | `2` | server | Codex runs at once. Further calls wait. |
+| `CODEX_MCP_MAX_PARALLEL` | no | `none` | server | Codex runs at once, or `none` for no limit. Past a limit, further calls wait. The limit is per server, and each Claude Code session starts its own. |
 | `CODEX_MCP_LOG` | no | `~/.local/state/codex-mcp/runs.jsonl` | server | The run log. |
 | `CLAUDE_BIN` | no | `claude` | installer | The Claude Code CLI. |
 | `CLAUDE_CONFIG` | no | `~/.claude.json` | installer | Where Claude Code keeps user-scope MCP entries. It is read to compare against, and never written. |

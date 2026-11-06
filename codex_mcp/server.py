@@ -26,7 +26,8 @@ Config (environment, set in the MCP entry):
     CODEX_MCP_HOST             if set, refuse to start on any other host (home is NFS-shared)
     CODEX_MCP_DEFAULT_SANDBOX  read-only | workspace-write  (default read-only)
     CODEX_MCP_TIMEOUT          seconds per call (default 1800)
-    CODEX_MCP_MAX_PARALLEL     concurrent Codex runs (default 2); further calls wait
+    CODEX_MCP_MAX_PARALLEL     concurrent Codex runs, or none for no limit (default none);
+                               past a limit, further calls wait
     CODEX_MCP_REPORTS          report schemas (default reports.json beside this file)
     CODEX_MCP_LOG              run log (default ~/.local/state/codex-mcp/runs.jsonl;
                                its directory must exist - `make install` makes it)
@@ -36,6 +37,7 @@ while calls ran: they are cancelled, logged and counted), 3 CONFIG (a setting is
 every problem is listed). The last line on stderr is always `exit: <code> <name> - <reason>`.
 """
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -50,13 +52,14 @@ import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+NO_LIMIT = "none"  # the CODEX_MCP_MAX_PARALLEL value that sets no limit
 SANDBOXES = ("read-only", "workspace-write")  # danger-full-access is never offered
 
 DEFAULTS = {
     "CODEX_MCP_BIN": "codex",
     "CODEX_MCP_DEFAULT_SANDBOX": "read-only",
     "CODEX_MCP_TIMEOUT": "1800",
-    "CODEX_MCP_MAX_PARALLEL": "2",
+    "CODEX_MCP_MAX_PARALLEL": NO_LIMIT,
     "CODEX_MCP_REPORTS": os.path.join(HERE, "reports.json"),
     "CODEX_MCP_LOG": os.path.expanduser("~/.local/state/codex-mcp/runs.jsonl"),
 }
@@ -71,7 +74,7 @@ DEFAULT_SANDBOX = setting("CODEX_MCP_DEFAULT_SANDBOX")
 REPORTS_PATH = setting("CODEX_MCP_REPORTS")
 LOG_PATH = setting("CODEX_MCP_LOG")
 TIMEOUT = None  # seconds; set and checked in configure()
-SLOTS = None    # semaphore of CODEX_MCP_MAX_PARALLEL; set in configure()
+SLOTS = None    # CODEX_MCP_MAX_PARALLEL: a semaphore, or a no-op for none; set in configure()
 
 REPORTS = {}  # kind -> JSON schema, loaded in main()
 _out_lock = threading.Lock()
@@ -514,13 +517,16 @@ def configure():
         problems.append("CODEX_MCP_TIMEOUT must be a positive number of seconds: %r"
                         % setting("CODEX_MCP_TIMEOUT"))
     try:
-        slots = int(setting("CODEX_MCP_MAX_PARALLEL"))
-        if slots < 1:
-            raise ValueError
-        SLOTS = threading.Semaphore(slots)
+        if setting("CODEX_MCP_MAX_PARALLEL") == NO_LIMIT:
+            SLOTS = contextlib.nullcontext()
+        else:
+            slots = int(setting("CODEX_MCP_MAX_PARALLEL"))
+            if slots < 1:
+                raise ValueError
+            SLOTS = threading.Semaphore(slots)
     except ValueError:
-        problems.append("CODEX_MCP_MAX_PARALLEL must be an integer >= 1: %r"
-                        % setting("CODEX_MCP_MAX_PARALLEL"))
+        problems.append("CODEX_MCP_MAX_PARALLEL must be an integer >= 1 or %s: %r"
+                        % (NO_LIMIT, setting("CODEX_MCP_MAX_PARALLEL")))
     try:
         with open(REPORTS_PATH) as f:
             REPORTS.update(json.load(f))

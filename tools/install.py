@@ -34,6 +34,7 @@ BEGIN = "<!-- claude-codex-mcp routing: begin (managed by make routing; edit rou
 END = "<!-- claude-codex-mcp routing: end -->"
 SMOKE_TIMEOUT = 30  # seconds for the server to answer initialize + tools/list
 NAME = "codex"  # the MCP server name; Claude exposes the tool as mcp__codex__codex
+NO_LIMIT = "none"  # the CODEX_MCP_MAX_PARALLEL value that sets no limit
 SANDBOXES = ("read-only", "workspace-write")
 EXIT_NAMES = {0: "OK", 1: "FAILED", 2: "USAGE", 3: "CONFIG"}
 
@@ -43,7 +44,7 @@ OPTIONAL = {
     "CODEX_MCP_HOST": THIS_HOST,
     "CODEX_MCP_DEFAULT_SANDBOX": "read-only",
     "CODEX_MCP_TIMEOUT": "1800",
-    "CODEX_MCP_MAX_PARALLEL": "2",
+    "CODEX_MCP_MAX_PARALLEL": NO_LIMIT,
     "CODEX_MCP_LOG": "~/.local/state/codex-mcp/runs.jsonl",
     "CLAUDE_BIN": "claude",
     "CLAUDE_CONFIG": "~/.claude.json",
@@ -129,11 +130,11 @@ def load_config(path):
         problems.append("CODEX_MCP_TIMEOUT must be a positive number of seconds: %r"
                         % cfg["CODEX_MCP_TIMEOUT"])
     try:
-        if int(cfg["CODEX_MCP_MAX_PARALLEL"]) < 1:
+        if cfg["CODEX_MCP_MAX_PARALLEL"] != NO_LIMIT and int(cfg["CODEX_MCP_MAX_PARALLEL"]) < 1:
             raise ValueError
     except ValueError:
-        problems.append("CODEX_MCP_MAX_PARALLEL must be an integer >= 1: %r"
-                        % cfg["CODEX_MCP_MAX_PARALLEL"])
+        problems.append("CODEX_MCP_MAX_PARALLEL must be an integer >= 1 or %s: %r"
+                        % (NO_LIMIT, cfg["CODEX_MCP_MAX_PARALLEL"]))
     if not os.path.isabs(cfg["CODEX_MCP_LOG"]):
         problems.append("CODEX_MCP_LOG must be an absolute path: %r" % cfg["CODEX_MCP_LOG"])
     if cfg["CODEX_MCP_HOST"] != socket.gethostname():
