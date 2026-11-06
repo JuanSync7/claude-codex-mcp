@@ -742,17 +742,55 @@ class LimitGateTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.log))  # codex never ran
         self.assertEqual(self.worktrees(), (1, 0))  # so its worktree is removed
 
-    def test_reset_across_a_clock_change_takes_the_new_offset(self):
+    def test_a_call_queued_behind_the_one_that_hits_the_limit_is_not_started(self):
+        queued = []
+
+        class Slot:  # the next call in line takes the slot the moment this one frees it
+            def __enter__(slot):
+                pass
+
+            def __exit__(slot, *exc):
+                if not queued:
+                    queued.append(None)
+                    queued[0] = self.server.run_codex(
+                        {"prompt": "x", "cwd": self.repo, "worktree": True})
+
+        with mock.patch.object(self.server, "SLOTS", Slot()):
+            self.call("limit")
+        body = json.loads(queued[0]["content"][0]["text"])
+        self.assertTrue(queued[0]["isError"])
+        self.assertTrue(body["error"].startswith("usage limit: not started"), body)
+        self.assertEqual(len(self.runs()), 1)  # only the first call ran codex
+        self.assertEqual(self.worktrees(), (1, 0))
+
+    def in_new_york(self):  # clocks go forward at 2:00 on 8 March, back at 2:00 on 1 November
         environ = mock.patch.dict(os.environ, TZ="America/New_York")
         environ.start()
         self.addCleanup(time.tzset)  # cleanups run last first: the old TZ, then tzset
         self.addCleanup(environ.stop)
         time.tzset()
+
+    def test_reset_across_a_clock_change_takes_the_new_offset(self):
+        self.in_new_york()
         said = "You\u2019ve hit your usage limit. Upgrade to Pro or try again at 7:00 AM."
         for now in (datetime.datetime(2026, 3, 8, 0, 30), datetime.datetime(2026, 3, 7, 23, 30)):
-            with self.subTest(now=now):  # clocks go forward at 2:00 on 8 March
+            with self.subTest(now=now):
                 limited, _ = self.server.usage_limit([said], now=now)
                 self.assertEqual(limited["until"], "2026-03-08T07:00:00-04:00")
+
+    def test_a_reset_time_the_clock_skips_or_repeats_takes_its_later_reading(self):
+        self.in_new_york()
+        for now, clock, until in (
+                (datetime.datetime(2026, 3, 8, 1, 45), "2:30 AM", "2026-03-08T03:30:00-04:00"),
+                (datetime.datetime(2026, 11, 1, 0, 30), "1:30 AM", "2026-11-01T01:30:00-05:00"),
+                # the first 1:45: the second 1:30 is still ahead today
+                (datetime.datetime(2026, 11, 1, 1, 45), "1:30 AM", "2026-11-01T01:30:00-05:00"),
+                (datetime.datetime(2026, 11, 1, 1, 45, fold=1), "1:30 AM",
+                 "2026-11-02T01:30:00-05:00")):
+            with self.subTest(now=now, fold=now.fold, clock=clock):
+                said = "You\u2019ve hit your usage limit. Upgrade to Pro or try again at %s." % clock
+                limited, _ = self.server.usage_limit([said], now=now)
+                self.assertEqual(limited["until"], until)
 
 
 class SlotsTest(unittest.TestCase):

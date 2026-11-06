@@ -311,13 +311,47 @@ def log_run(entry):
         return "run log %s: %r" % (LOG_PATH, e)
 
 
+def read_events(out):
+    """Codex's JSON event lines, as (messages, error events, commands, usage, thread id,
+    unparsed lines, the messages of error events)."""
+    messages, events_err, commands, usage, thread, unparsed = [], [], [], None, None, []
+    said = []  # the messages of error events, read for a usage limit
+    for line in out.splitlines():
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            if line.strip():
+                unparsed.append(line[:500])  # returned, so a format change shows up
+            continue
+        if not isinstance(ev, dict):
+            unparsed.append(line[:500])
+            continue
+        kind = ev.get("type")
+        item = ev.get("item") or {}
+        if kind == "thread.started":
+            thread = ev.get("thread_id")
+        elif kind == "item.completed" and item.get("type") == "agent_message":
+            messages.append(item.get("text", ""))
+        elif kind == "item.completed" and item.get("type") == "command_execution":
+            commands.append({"command": item.get("command"), "exit_code": item.get("exit_code")})
+        elif kind == "turn.completed":
+            usage = ev.get("usage")
+        elif kind in ("error", "turn.failed"):
+            events_err.append(json.dumps(ev))
+            text = ev.get("message") or (ev.get("error") or {}).get("message")
+            if isinstance(text, str):
+                said.append(text)
+    return messages, events_err, commands, usage, thread, unparsed, said
+
+
 def usage_limit(said, now=None):
     """Codex's usage-limit message among the messages of its error events, as the pair
     ({"until": ISO local time or None if no reset time could be read, "said": the message},
     the reset as a datetime or None), or (None, None) when none is a usage limit. Codex
     gives only a clock time, so one already past today means tomorrow. `now` is naive
     local time (default: now); the reset takes its own UTC offset, so a clock change
-    in between is counted."""
+    in between is counted, and a time the clock skips or repeats that day takes its
+    later reading, so the gate never opens before Codex's reset."""
     hit = [m for m in said if LIMITS["match"].search(m)]
     if not hit:
         return None, None
@@ -329,11 +363,16 @@ def usage_limit(said, now=None):
         except ValueError as e:  # the pattern matched text the format cannot read
             sys.stderr.write("warning: cannot read the reset time %r: %s\n" % (found.group(1), e))
         else:
-            now = now or datetime.datetime.now()
-            at = now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
-            if at <= now:
-                at += datetime.timedelta(days=1)
-            until = at.astimezone()  # naive local time: the offset in force at the reset
+            now = (now or datetime.datetime.now()).astimezone()
+            for ahead in (0, 1):  # today, else tomorrow
+                wall = datetime.datetime.combine(now.date() + datetime.timedelta(days=ahead),
+                                                 datetime.time(clock.hour, clock.minute))
+                # naive local time takes the offset in force then; fold picks a skipped or
+                # repeated time's two readings, and Python 3.6 orders them the other way
+                at = max(wall.replace(fold=fold).astimezone() for fold in (0, 1))
+                if at > now:
+                    until = at
+                    break
     return {"until": until and until.isoformat(), "said": hit[-1]}, until
 
 
@@ -442,6 +481,12 @@ def run_codex(args):
                     error = "cancelled mid-run: the client closed the connection"
                 elif why == "timeout":
                     error = "codex timed out after %gs" % TIMEOUT
+                messages, events_err, commands, usage, thread, unparsed, said = read_events(out)
+                limited, until = usage_limit(said)
+                if until is not None:  # before the slot frees, so the next call in line sees it
+                    with _limit_lock:
+                        if LIMITED_UNTIL is None or until >= LIMITED_UNTIL:
+                            LIMITED, LIMITED_UNTIL = limited, until
         finally:
             if schema_file:
                 try:
@@ -456,40 +501,6 @@ def run_codex(args):
                                  % (worktree["path"], cleanup))
         raise
     duration = round(time.monotonic() - t0, 1)
-
-    messages, events_err, commands, usage, thread, unparsed = [], [], [], None, None, []
-    said = []  # the messages of error events, read for a usage limit
-    for line in out.splitlines():
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            if line.strip():
-                unparsed.append(line[:500])  # returned, so a format change shows up
-            continue
-        if not isinstance(ev, dict):
-            unparsed.append(line[:500])
-            continue
-        kind = ev.get("type")
-        item = ev.get("item") or {}
-        if kind == "thread.started":
-            thread = ev.get("thread_id")
-        elif kind == "item.completed" and item.get("type") == "agent_message":
-            messages.append(item.get("text", ""))
-        elif kind == "item.completed" and item.get("type") == "command_execution":
-            commands.append({"command": item.get("command"), "exit_code": item.get("exit_code")})
-        elif kind == "turn.completed":
-            usage = ev.get("usage")
-        elif kind in ("error", "turn.failed"):
-            events_err.append(json.dumps(ev))
-            text = ev.get("message") or (ev.get("error") or {}).get("message")
-            if isinstance(text, str):
-                said.append(text)
-
-    limited, until = usage_limit(said)
-    if until is not None:
-        with _limit_lock:
-            if LIMITED_UNTIL is None or until >= LIMITED_UNTIL:
-                LIMITED, LIMITED_UNTIL = limited, until
 
     files = None
     if top:

@@ -167,8 +167,11 @@ beside it) and `CODEX_MCP_LIMITS` (by default `limits.json` beside it). The inst
 neither. `limits.json` says how Codex words the usage limit, which it gives only as free
 text: `match` finds the message, `reset_at` captures the reset time (one group) and
 `reset_format` reads it with `strptime`. Codex gives a clock time with no date, so a time
-already past today means tomorrow. When Codex changes its wording, edit this file; a file
-that does not load, or a `reset_at` without exactly one group, stops the server starting.
+already past today means tomorrow, and a time the clock skips or repeats on a clock change
+is read as its later moment, so the gate never opens early. When Codex changes its
+wording, edit this file; a file that does not load, a `reset_at` without exactly one
+group, or a `reset_format` that cannot read back an hour and minute stops the server
+starting.
 
 ## Leak check
 
