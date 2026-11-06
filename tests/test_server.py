@@ -221,7 +221,10 @@ class ServerTest(unittest.TestCase):
         bad = os.path.join(self.tmp.name, "limits.json")
         for content in ("{", '{"match": "x"}',
                         '{"match": "(", "reset_at": "a(b)", "reset_format": "%H:%M"}',
-                        '{"match": "x", "reset_at": "no group", "reset_format": "%H:%M"}'):
+                        '{"match": "x", "reset_at": "no group", "reset_format": "%H:%M"}',
+                        '{"match": "x", "reset_at": "(a)", "reset_format": null}',
+                        '{"match": "x", "reset_at": "(a)", "reset_format": "%Q"}',
+                        '{"match": "x", "reset_at": "(a)", "reset_format": "%H"}'):
             with self.subTest(content=content):
                 with open(bad, "w") as f:
                     f.write(content)
@@ -721,6 +724,35 @@ class LimitGateTest(unittest.TestCase):
         self.call("limit", said="You\u2019ve hit your usage limit.")
         err, body = self.call("ok")
         self.assertFalse(err, body)
+
+    def test_limit_found_while_a_call_prepares_stops_it_before_codex_starts(self):
+        real = self.server.sandbox_start
+        until = datetime.datetime.now().astimezone() + datetime.timedelta(hours=2)
+        limited = {"until": until.isoformat(), "said": "You\u2019ve hit your usage limit."}
+
+        def then_limit(*a):  # the gate passed; another call hits the limit meanwhile
+            result = real(*a)
+            self.server.LIMITED, self.server.LIMITED_UNTIL = limited, until
+            return result
+
+        with mock.patch.object(self.server, "sandbox_start", then_limit):
+            err, body = self.call("ok", worktree=True)
+        self.assertTrue(err)
+        self.assertEqual(body["limited"], limited)
+        self.assertFalse(os.path.exists(self.log))  # codex never ran
+        self.assertEqual(self.worktrees(), (1, 0))  # so its worktree is removed
+
+    def test_reset_across_a_clock_change_takes_the_new_offset(self):
+        environ = mock.patch.dict(os.environ, TZ="America/New_York")
+        environ.start()
+        self.addCleanup(time.tzset)  # cleanups run last first: the old TZ, then tzset
+        self.addCleanup(environ.stop)
+        time.tzset()
+        said = "You\u2019ve hit your usage limit. Upgrade to Pro or try again at 7:00 AM."
+        for now in (datetime.datetime(2026, 3, 8, 0, 30), datetime.datetime(2026, 3, 7, 23, 30)):
+            with self.subTest(now=now):  # clocks go forward at 2:00 on 8 March
+                limited, _ = self.server.usage_limit([said], now=now)
+                self.assertEqual(limited["until"], "2026-03-08T07:00:00-04:00")
 
 
 class SlotsTest(unittest.TestCase):

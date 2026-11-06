@@ -91,10 +91,11 @@ The usual patterns:
   not removed for you.
 - **Usage limit:** a call that comes back with `limited` is parked, not failed. Wait until
   `limited.until` (a scheduled wake-up, not a polling loop) and send the same call again;
-  when `until` is `null`, wait an hour and try again. Until then the server refuses new
-  calls at once, with the same `limited`: Codex is not started, no worktree is made, and
-  nothing is logged. The gate is per server, so another Claude Code session finds the
-  limit with one run of its own.
+  when `until` is `null`, wait an hour and try again. When `until` is known, the server
+  refuses every call made before it at once, with the same `limited`: Codex is not
+  started, no worktree is made (one already made for a call in progress is removed), and
+  nothing is logged. A `null` `until` sets no such gate. The gate is per server, so another
+  Claude Code session finds the limit with one run of its own.
 
 Before Codex starts, the server runs `codex sandbox` with the call's sandbox in the run
 folder and asks a shell there where it starts. A sandbox that cannot see the folder starts

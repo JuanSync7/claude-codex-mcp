@@ -311,11 +311,13 @@ def log_run(entry):
         return "run log %s: %r" % (LOG_PATH, e)
 
 
-def usage_limit(said):
+def usage_limit(said, now=None):
     """Codex's usage-limit message among the messages of its error events, as the pair
     ({"until": ISO local time or None if no reset time could be read, "said": the message},
     the reset as a datetime or None), or (None, None) when none is a usage limit. Codex
-    gives only a clock time, so one already past today means tomorrow."""
+    gives only a clock time, so one already past today means tomorrow. `now` is naive
+    local time (default: now); the reset takes its own UTC offset, so a clock change
+    in between is counted."""
     hit = [m for m in said if LIMITS["match"].search(m)]
     if not hit:
         return None, None
@@ -327,11 +329,22 @@ def usage_limit(said):
         except ValueError as e:  # the pattern matched text the format cannot read
             sys.stderr.write("warning: cannot read the reset time %r: %s\n" % (found.group(1), e))
         else:
-            now = datetime.datetime.now().astimezone()
-            until = now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
-            if until <= now:
-                until += datetime.timedelta(days=1)
+            now = now or datetime.datetime.now()
+            at = now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+            if at <= now:
+                at += datetime.timedelta(days=1)
+            until = at.astimezone()  # naive local time: the offset in force at the reset
     return {"until": until and until.isoformat(), "said": hit[-1]}, until
+
+
+def limit_gate():
+    """The refusal for a call made before a known usage-limit reset, or None."""
+    with _limit_lock:
+        limited, until = LIMITED, LIMITED_UNTIL
+    if until is None or datetime.datetime.now().astimezone() >= until:
+        return None
+    return {"ok": False, "limited": limited,
+            "error": "usage limit: not started; Codex said it resets at %s" % limited["until"]}
 
 
 def run_codex(args):
@@ -351,13 +364,9 @@ def run_codex(args):
     if report_kind is not None and report_kind not in REPORTS:
         return tool_result("report must be one of %s, got %r" % (sorted(REPORTS), report_kind),
                            True)
-    with _limit_lock:
-        limited, until = LIMITED, LIMITED_UNTIL
-    if until is not None and datetime.datetime.now().astimezone() < until:
-        return tool_result(json.dumps({
-            "ok": False, "limited": limited,
-            "error": "usage limit: not started; Codex said it resets at %s" % limited["until"],
-        }, indent=1), True)
+    gated = limit_gate()
+    if gated:
+        return tool_result(json.dumps(gated, indent=1), True)
 
     worktree, run_dir = None, cwd
     if want_wt:
@@ -371,11 +380,14 @@ def run_codex(args):
     if bindir:
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
 
-    def refuse(error):  # codex never ran: undo the worktree made for it
+    def refuse(error, body=None):  # codex never ran: undo the worktree made for it
         if worktree:
             cleanup = remove_worktree(cwd, worktree)
             if cleanup:
                 error += "; the new worktree %s is left behind: %s" % (worktree["path"], cleanup)
+        if body is not None:
+            body["error"] = error
+            return tool_result(json.dumps(body, indent=1), True)
         return tool_result(error, True)
 
     started = False  # set as codex itself starts: a worktree it may have touched is kept
@@ -418,6 +430,9 @@ def run_codex(args):
                 if CANCEL.is_set():  # queued behind another call when the client left
                     return refuse("cancelled before codex started: the client closed "
                                   "the connection")
+                gated = limit_gate()  # another call may have hit the limit meanwhile
+                if gated:
+                    return refuse(gated["error"], gated)
                 started = True
                 try:
                     rc, out, err, why = run_tracked(cmd, run_dir, env)
@@ -604,6 +619,12 @@ def configure():
                       reset_format=limits["reset_format"])
         if LIMITS["reset_at"].groups != 1:
             raise ValueError("reset_at must have exactly one group, the reset time")
+        sample = datetime.datetime(2000, 1, 1, 19, 5)  # an afternoon time, with minutes
+        read = datetime.datetime.strptime(sample.strftime(LIMITS["reset_format"]),
+                                          LIMITS["reset_format"])
+        if (read.hour, read.minute) != (sample.hour, sample.minute):
+            raise ValueError("reset_format %r does not read back an hour and minute"
+                             % LIMITS["reset_format"])
     except Exception as e:
         problems.append("cannot load usage-limit patterns %s: %r" % (LIMITS_PATH, e))
     return problems
