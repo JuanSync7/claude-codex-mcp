@@ -37,7 +37,6 @@ while calls ran: they are cancelled, logged and counted), 3 CONFIG (a setting is
 every problem is listed). The last line on stderr is always `exit: <code> <name> - <reason>`.
 """
 
-import contextlib
 import datetime
 import hashlib
 import json
@@ -498,6 +497,17 @@ def handle_call(req_id, params):
             _calls.discard(threading.current_thread())
 
 
+class NoLimit:
+    """The slot for CODEX_MCP_MAX_PARALLEL=none: entering it never waits.
+    (contextlib.nullcontext would do, but needs Python 3.7.)"""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 def configure():
     """Check the settings; returns a list of problems (empty when all is well)."""
     global TIMEOUT, SLOTS
@@ -518,7 +528,7 @@ def configure():
                         % setting("CODEX_MCP_TIMEOUT"))
     try:
         if setting("CODEX_MCP_MAX_PARALLEL") == NO_LIMIT:
-            SLOTS = contextlib.nullcontext()
+            SLOTS = NoLimit()
         else:
             slots = int(setting("CODEX_MCP_MAX_PARALLEL"))
             if slots < 1:
