@@ -73,6 +73,7 @@ The result is one JSON object:
 | `observed.commands` | Every shell command Codex ran, with its exit code. |
 | `observed.files_changed` | Files that differ in a git snapshot taken before and after the run. Codex edits through shell commands, which emit no file-change event, so the snapshot is the evidence. Outside a git repo this is `null` (unknown), never `[]`. |
 | `mismatch` | With `report: "task"`: files Codex claimed but did not change, and files it changed but did not claim. |
+| `limited` | When Codex hit the ChatGPT usage limit: `until`, when Codex said it resets (local time, ISO 8601, or `null` when no time could be read), and `said`, its own words. `null` otherwise. |
 | `worktree` | The worktree's path, branch and base commit, when one was made. |
 | `run` | Exit code, sandbox, model, token usage and duration. `unparsed_lines` holds any Codex output line that was not a JSON event, so nothing is dropped unseen. |
 | `log_error` | Why the run could not be logged, or `null`. |
@@ -88,6 +89,12 @@ The usual patterns:
   tests yourself, and review the diff in the worktree. Then merge or discard, and remove
   it (`git worktree remove <path>`, `git branch -D <branch>`). A worktree Codex ran in is
   not removed for you.
+- **Usage limit:** a call that comes back with `limited` is parked, not failed. Wait until
+  `limited.until` (a scheduled wake-up, not a polling loop) and send the same call again;
+  when `until` is `null`, wait an hour and try again. Until then the server refuses new
+  calls at once, with the same `limited`: Codex is not started, no worktree is made, and
+  nothing is logged. The gate is per server, so another Claude Code session finds the
+  limit with one run of its own.
 
 Before Codex starts, the server runs `codex sandbox` with the call's sandbox in the run
 folder and asks a shell there where it starts. A sandbox that cannot see the folder starts
@@ -155,7 +162,12 @@ anything is changed. Each optional key that is left out prints a `[using default
 | `LEAKCHECK_WORDS` | no | | leak check | Comma-separated words that must never be committed. |
 
 The server also reads `CODEX_MCP_REPORTS` (the report schemas; by default `reports.json`
-beside it). The installer does not set it.
+beside it) and `CODEX_MCP_LIMITS` (by default `limits.json` beside it). The installer sets
+neither. `limits.json` says how Codex words the usage limit, which it gives only as free
+text: `match` finds the message, `reset_at` captures the reset time (one group) and
+`reset_format` reads it with `strptime`. Codex gives a clock time with no date, so a time
+already past today means tomorrow. When Codex changes its wording, edit this file; a file
+that does not load, or a `reset_at` without exactly one group, stops the server starting.
 
 ## Leak check
 

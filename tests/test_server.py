@@ -1,5 +1,6 @@
 """Drives server.py over stdio against a fake codex. Run: python3.12 -m unittest test_server"""
 
+import datetime
 import importlib.util
 import json
 import os
@@ -56,7 +57,23 @@ FAKE = textwrap.dedent("""\
         print(json.dumps({"type": "turn.completed", "usage": {"output_tokens": 1}}))
     if mode in ("fail", "msgfail"):
         sys.stderr.write("boom\\n"); sys.exit(3)
+    if mode == "limit":
+        said = os.environ["FAKE_LIMIT_SAID"]
+        print(json.dumps({"type": "error", "message": said}))
+        print(json.dumps({"type": "turn.failed", "error": {"message": said}}))
+        sys.exit(1)
     """) % sys.executable
+
+
+
+def limit_said(hours=2):
+    """Codex's usage-limit message, with a reset `hours` from now in this host's local time;
+    returns (message, the reset's local hour and minute)."""
+    at = datetime.datetime.now() + datetime.timedelta(hours=hours)
+    clock = "%d:%02d %s" % (at.hour % 12 or 12, at.minute, "AM" if at.hour < 12 else "PM")
+    return ("You\u2019ve hit your usage limit. Upgrade to Pro or try again at %s." % clock,
+            (at.hour, at.minute))
+
 
 REVIEW = {"verdict": "approve", "summary": "fine", "findings": [], "checked": ["a.txt"],
           "confidence": "medium"}
@@ -200,6 +217,18 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(r, {})
         self.assert_exit_line(p.stderr, 3, "CONFIG", "nope.json")
 
+    def test_broken_limit_patterns_refuse_to_start(self):
+        bad = os.path.join(self.tmp.name, "limits.json")
+        for content in ("{", '{"match": "x"}',
+                        '{"match": "(", "reset_at": "a(b)", "reset_format": "%H:%M"}',
+                        '{"match": "x", "reset_at": "no group", "reset_format": "%H:%M"}'):
+            with self.subTest(content=content):
+                with open(bad, "w") as f:
+                    f.write(content)
+                p, _ = self.session([], CODEX_MCP_LIMITS=bad)
+                self.assertEqual(p.returncode, 3, p.stderr)
+                self.assertIn(bad, p.stderr)
+
     def test_bad_settings_refuse_to_start_listing_every_problem(self):
         p, r = self.session([{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
                             CODEX_MCP_TIMEOUT="soon", CODEX_MCP_MAX_PARALLEL="0",
@@ -298,6 +327,45 @@ class ServerTest(unittest.TestCase):
         err, body = self.call({"prompt": "ping", "cwd": self.work}, mode="silent")
         self.assertTrue(err)
         self.assertIn("no final message", body["error"])
+
+    def test_usage_limit_is_reported_with_its_reset_time(self):
+        said, hour_minute = limit_said()
+        err, body = self.call({"prompt": "x", "cwd": self.work}, mode="limit",
+                              FAKE_LIMIT_SAID=said)
+        self.assertTrue(err)
+        self.assertFalse(body["ok"])
+        until = datetime.datetime.fromisoformat(body["limited"]["until"])
+        now = datetime.datetime.now().astimezone()
+        self.assertEqual((until.hour, until.minute), hour_minute)
+        self.assertTrue(now < until <= now + datetime.timedelta(days=1), (now, until))
+        self.assertEqual(body["limited"]["said"], said)
+        self.assertEqual(self.runs()[0]["limited_until"], body["limited"]["until"])
+
+    def test_reset_time_already_past_today_means_tomorrow(self):
+        said, hour_minute = limit_said(hours=-2)
+        _, body = self.call({"prompt": "x", "cwd": self.work}, mode="limit",
+                            FAKE_LIMIT_SAID=said)
+        until = datetime.datetime.fromisoformat(body["limited"]["until"])
+        now = datetime.datetime.now().astimezone()
+        self.assertEqual((until.hour, until.minute), hour_minute)
+        self.assertTrue(now < until <= now + datetime.timedelta(days=1), (now, until))
+
+    def test_usage_limit_without_a_readable_reset_time(self):
+        said = "You\u2019ve hit your usage limit. Come back later."
+        err, body = self.call({"prompt": "x", "cwd": self.work}, mode="limit",
+                              FAKE_LIMIT_SAID=said)
+        self.assertTrue(err)
+        self.assertIsNone(body["limited"]["until"])
+        self.assertEqual(body["limited"]["said"], said)
+
+    def test_other_failures_are_not_limited(self):
+        self.assertIsNone(self.call({"prompt": "x", "cwd": self.work}, mode="fail")[1]["limited"])
+        self.assertIsNone(self.call({"prompt": "x", "cwd": self.work})[1]["limited"])
+        err, body = self.call({"prompt": "x", "cwd": self.work}, mode="limit",
+                              FAKE_LIMIT_SAID="stream disconnected; try again at 7:00 AM.")
+        self.assertTrue(err)  # an error event, but not the usage limit
+        self.assertIsNone(body["limited"])
+        self.assertEqual([r["limited_until"] for r in self.runs()], [None, None, None])
 
     def test_danger_sandbox_refused_without_running(self):
         err, _ = self.call({"prompt": "x", "cwd": self.work, "sandbox": "danger-full-access"})
@@ -612,6 +680,47 @@ class PreStartTest(unittest.TestCase):
                 self.run_in_worktree()
         self.assertTrue(os.path.exists(self.log))  # codex ran
         self.assertEqual(self.worktrees(), (2, 1))  # what it may have changed is kept
+
+
+class LimitGateTest(unittest.TestCase):
+    """Once Codex says the usage limit resets at a known time, calls before then are refused
+    without starting Codex or making a worktree; after it, they run again."""
+    tearDown, make_repo, runs = ServerTest.tearDown, ServerTest.make_repo, ServerTest.runs
+    worktrees = PreStartTest.worktrees
+
+    def setUp(self):
+        PreStartTest.setUp(self)  # its os.environ patch also undoes the keys set below
+        self.assertEqual(self.server.configure(), [])
+
+    def call(self, mode, said=None, **args):
+        os.environ["FAKE_MODE"] = mode
+        os.environ["FAKE_LIMIT_SAID"] = said or limit_said()[0]
+        if os.path.exists(self.log):
+            os.remove(self.log)
+        res = self.server.run_codex(dict({"prompt": "x", "cwd": self.repo}, **args))
+        return res["isError"], json.loads(res["content"][0]["text"])
+
+    def test_calls_wait_for_the_reset_then_run_again(self):
+        _, first = self.call("limit")
+        self.assertTrue(os.path.exists(self.log))  # codex ran and said so
+        err, second = self.call("ok", worktree=True)
+        self.assertTrue(err)
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["limited"], first["limited"])
+        self.assertFalse(os.path.exists(self.log))  # not started
+        self.assertEqual(self.worktrees(), (1, 0))  # and no worktree made for it
+        self.assertEqual(len(self.runs()), 1)  # a refusal is not a run
+
+        self.server.LIMITED_UNTIL = (datetime.datetime.now().astimezone()
+                                     - datetime.timedelta(seconds=1))
+        err, third = self.call("ok")
+        self.assertFalse(err, third)
+        self.assertIsNone(third["limited"])
+
+    def test_no_known_reset_time_means_no_gate(self):
+        self.call("limit", said="You\u2019ve hit your usage limit.")
+        err, body = self.call("ok")
+        self.assertFalse(err, body)
 
 
 class SlotsTest(unittest.TestCase):

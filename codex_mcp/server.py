@@ -29,6 +29,8 @@ Config (environment, set in the MCP entry):
     CODEX_MCP_MAX_PARALLEL     concurrent Codex runs, or none for no limit (default none);
                                past a limit, further calls wait
     CODEX_MCP_REPORTS          report schemas (default reports.json beside this file)
+    CODEX_MCP_LIMITS           how Codex words its usage limit and reset time
+                               (default limits.json beside this file)
     CODEX_MCP_LOG              run log (default ~/.local/state/codex-mcp/runs.jsonl;
                                its directory must exist - `make install` makes it)
 
@@ -41,6 +43,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import socket
@@ -60,6 +63,7 @@ DEFAULTS = {
     "CODEX_MCP_TIMEOUT": "1800",
     "CODEX_MCP_MAX_PARALLEL": NO_LIMIT,
     "CODEX_MCP_REPORTS": os.path.join(HERE, "reports.json"),
+    "CODEX_MCP_LIMITS": os.path.join(HERE, "limits.json"),
     "CODEX_MCP_LOG": os.path.expanduser("~/.local/state/codex-mcp/runs.jsonl"),
 }
 
@@ -71,11 +75,17 @@ EXIT_NAMES = {0: "OK", 1: "FAILED", 3: "CONFIG"}
 CODEX_BIN = setting("CODEX_MCP_BIN")
 DEFAULT_SANDBOX = setting("CODEX_MCP_DEFAULT_SANDBOX")
 REPORTS_PATH = setting("CODEX_MCP_REPORTS")
+LIMITS_PATH = setting("CODEX_MCP_LIMITS")
 LOG_PATH = setting("CODEX_MCP_LOG")
 TIMEOUT = None  # seconds; set and checked in configure()
 SLOTS = None    # CODEX_MCP_MAX_PARALLEL: a semaphore, or a no-op for none; set in configure()
 
 REPORTS = {}  # kind -> JSON schema, loaded in main()
+LIMITS = {}   # match, reset_at (compiled) and reset_format, loaded in configure()
+# After Codex says the usage limit resets at a known time, calls before then are refused
+# without starting it: LIMITED is what that run reported, LIMITED_UNTIL its reset.
+LIMITED, LIMITED_UNTIL = None, None
+_limit_lock = threading.Lock()
 _out_lock = threading.Lock()
 _log_lock = threading.Lock()
 
@@ -301,7 +311,31 @@ def log_run(entry):
         return "run log %s: %r" % (LOG_PATH, e)
 
 
+def usage_limit(said):
+    """Codex's usage-limit message among the messages of its error events, as the pair
+    ({"until": ISO local time or None if no reset time could be read, "said": the message},
+    the reset as a datetime or None), or (None, None) when none is a usage limit. Codex
+    gives only a clock time, so one already past today means tomorrow."""
+    hit = [m for m in said if LIMITS["match"].search(m)]
+    if not hit:
+        return None, None
+    found = LIMITS["reset_at"].search(hit[-1])
+    until = None
+    if found:
+        try:
+            clock = datetime.datetime.strptime(found.group(1), LIMITS["reset_format"])
+        except ValueError as e:  # the pattern matched text the format cannot read
+            sys.stderr.write("warning: cannot read the reset time %r: %s\n" % (found.group(1), e))
+        else:
+            now = datetime.datetime.now().astimezone()
+            until = now.replace(hour=clock.hour, minute=clock.minute, second=0, microsecond=0)
+            if until <= now:
+                until += datetime.timedelta(days=1)
+    return {"until": until and until.isoformat(), "said": hit[-1]}, until
+
+
 def run_codex(args):
+    global LIMITED, LIMITED_UNTIL
     prompt = args.get("prompt")
     cwd = args.get("cwd")
     sandbox = args.get("sandbox") or DEFAULT_SANDBOX
@@ -317,6 +351,13 @@ def run_codex(args):
     if report_kind is not None and report_kind not in REPORTS:
         return tool_result("report must be one of %s, got %r" % (sorted(REPORTS), report_kind),
                            True)
+    with _limit_lock:
+        limited, until = LIMITED, LIMITED_UNTIL
+    if until is not None and datetime.datetime.now().astimezone() < until:
+        return tool_result(json.dumps({
+            "ok": False, "limited": limited,
+            "error": "usage limit: not started; Codex said it resets at %s" % limited["until"],
+        }, indent=1), True)
 
     worktree, run_dir = None, cwd
     if want_wt:
@@ -402,6 +443,7 @@ def run_codex(args):
     duration = round(time.monotonic() - t0, 1)
 
     messages, events_err, commands, usage, thread, unparsed = [], [], [], None, None, []
+    said = []  # the messages of error events, read for a usage limit
     for line in out.splitlines():
         try:
             ev = json.loads(line)
@@ -424,6 +466,15 @@ def run_codex(args):
             usage = ev.get("usage")
         elif kind in ("error", "turn.failed"):
             events_err.append(json.dumps(ev))
+            text = ev.get("message") or (ev.get("error") or {}).get("message")
+            if isinstance(text, str):
+                said.append(text)
+
+    limited, until = usage_limit(said)
+    if until is not None:
+        with _limit_lock:
+            if LIMITED_UNTIL is None or until >= LIMITED_UNTIL:
+                LIMITED, LIMITED_UNTIL = limited, until
 
     files = None
     if top:
@@ -462,6 +513,7 @@ def run_codex(args):
         "report": report,
         "observed": {"commands": commands, "files_changed": files, "files_basis": basis},
         "mismatch": mismatch,
+        "limited": limited,
         "worktree": worktree,
         "run": {"exit": rc, "sandbox": sandbox, "model": model, "thread": thread,
                 "usage": usage, "duration_s": duration, "unparsed_lines": unparsed},
@@ -471,7 +523,7 @@ def run_codex(args):
         "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "host": socket.gethostname(), "cwd": cwd, "worktree": worktree, "sandbox": sandbox,
         "model": model, "report": report_kind, "ok": body["ok"], "exit": rc,
-        "error": error and error[:300],
+        "error": error and error[:300], "limited_until": limited and limited["until"],
         "duration_s": duration, "usage": usage, "spend": "chatgpt-quota (notional)",
         "commands": len(commands), "files_changed": None if files is None else len(files),
         "prompt_head": prompt[:200],
@@ -545,6 +597,15 @@ def configure():
                 raise ValueError("schema %r has no required list" % kind)
     except Exception as e:
         problems.append("cannot load report schemas %s: %r" % (REPORTS_PATH, e))
+    try:
+        with open(LIMITS_PATH) as f:
+            limits = json.load(f)
+        LIMITS.update(match=re.compile(limits["match"]), reset_at=re.compile(limits["reset_at"]),
+                      reset_format=limits["reset_format"])
+        if LIMITS["reset_at"].groups != 1:
+            raise ValueError("reset_at must have exactly one group, the reset time")
+    except Exception as e:
+        problems.append("cannot load usage-limit patterns %s: %r" % (LIMITS_PATH, e))
     return problems
 
 
