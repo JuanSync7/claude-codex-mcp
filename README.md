@@ -86,8 +86,8 @@ The usual patterns:
   that edits what it judges gives no verdict.
 - **Task:** `worktree: true`, `report: "task"`. Check `observed` and `mismatch`, run the
   tests yourself, and review the diff in the worktree. Then merge or discard, and remove
-  it (`git worktree remove <path>`, `git branch -D <branch>`). Worktrees are not removed
-  for you.
+  it (`git worktree remove <path>`, `git branch -D <branch>`). A worktree Codex ran in is
+  not removed for you.
 
 Before Codex starts, the server runs `codex sandbox` with the call's sandbox in the run
 folder and asks a shell there where it starts. A sandbox that cannot see the folder starts
@@ -95,7 +95,10 @@ Codex in the home folder, with no error: the read-only sandbox, for one, mounts 
 empty `/dev/shm`. When the shell does not start in the run folder, the call is refused
 before Codex runs (no quota spent, nothing logged), and a worktree made for it is removed.
 The check runs like Codex itself: a client that disconnects during it kills it, and the
-worktree is removed then too.
+worktree is removed then too. So is a worktree whose call ends any other way before Codex
+starts: cancelled while waiting for a free slot, Codex failing to start, or a server error.
+Once Codex has started, its worktree is kept even when the call fails, because it may hold
+Codex's changes.
 
 Codex's actions bypass Claude Code's hooks and permissions. Every run is therefore
 appended to a JSONL log (mode 0600) with its host, directory, sandbox, outcome and error,

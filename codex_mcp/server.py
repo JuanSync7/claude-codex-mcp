@@ -198,15 +198,22 @@ def make_worktree(cwd):
     return {"path": path, "branch": branch, "base": base}, run_dir
 
 
+class NotStarted(Exception):
+    """cmd could not be started: no process exists, so nothing it could have touched."""
+
+
 def run_tracked(cmd, cwd, env):
     """Run cmd in its own process group where a cancel can kill it.
 
     Returns (returncode, stdout, stderr, why): why is "timeout", "cancelled" or None.
-    Raises OSError when cmd cannot start.
+    Raises NotStarted when cmd cannot start; any other error means it did start.
     """
-    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            universal_newlines=True, start_new_session=True)
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, start_new_session=True)
+    except Exception as e:
+        raise NotStarted(e)
     with _calls_lock:
         _running[proc.pid] = proc
     if CANCEL.is_set():  # the cancel ran before the process was registered
@@ -249,7 +256,7 @@ def sandbox_start(sandbox, run_dir, env):
            "/bin/sh", "-c", "pwd"]
     try:
         rc, out, err, why = run_tracked(cmd, run_dir, env)
-    except OSError as e:
+    except NotStarted as e:
         return None, "could not check the sandbox (%s): %s" % (CODEX_BIN, e)
     if why == "cancelled":
         return None, "cancelled before codex started: the client closed the connection"
@@ -321,12 +328,6 @@ def run_codex(args):
     if bindir:
         env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
 
-    start, error = sandbox_start(sandbox, run_dir, env)
-    if error is None and os.path.realpath(start) != os.path.realpath(run_dir):
-        error = ("cwd is not visible inside the %s sandbox: a shell there starts in %s, not %s, "
-                 "so Codex would work on the wrong folder. Use a folder the sandbox shows, "
-                 "or workspace-write, which mounts cwd." % (sandbox, os.path.realpath(start),
-                                                            run_dir))
     def refuse(error):  # codex never ran: undo the worktree made for it
         if worktree:
             cleanup = remove_worktree(cwd, worktree)
@@ -334,52 +335,68 @@ def run_codex(args):
                 error += "; the new worktree %s is left behind: %s" % (worktree["path"], cleanup)
         return tool_result(error, True)
 
-    if error is not None:
-        return refuse(error)
-
-    top = git(run_dir, "rev-parse", "--show-toplevel")
-    top = top.strip() if top else None
-    if top is None:
-        basis = "unknown: not a git repo"
-    elif worktree:
-        basis = "git-snapshot (isolated worktree)"
-    else:
-        basis = "git-snapshot (shared tree: includes any other writer during the run)"
-    before = snapshot(top) if top else None
-
-    cmd = [CODEX_BIN, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
-           "-c", 'sandbox_mode="%s"' % sandbox, "-C", run_dir]
-    if model:
-        cmd += ["-m", model]
-    schema_file = None
-    if report_kind:
-        fd, schema_file = tempfile.mkstemp(prefix="codex-report-", suffix=".json")
-        with os.fdopen(fd, "w") as f:
-            json.dump(REPORTS[report_kind], f)
-        cmd += ["--output-schema", schema_file]
-    cmd += ["--", prompt]
-
-    t0 = time.monotonic()
-    error, out, err, rc = None, "", "", None
+    started = False  # set as codex itself starts: a worktree it may have touched is kept
     try:
-        with SLOTS:
-            if CANCEL.is_set():  # queued behind another call when the client left
-                return refuse("cancelled before codex started: the client closed "
-                              "the connection")
-            try:
-                rc, out, err, why = run_tracked(cmd, run_dir, env)
-            except OSError as e:
-                return refuse("could not start codex (%s): %s" % (CODEX_BIN, e))
-            if why == "cancelled":
-                error = "cancelled mid-run: the client closed the connection"
-            elif why == "timeout":
-                error = "codex timed out after %gs" % TIMEOUT
-    finally:
-        if schema_file:
-            try:
-                os.remove(schema_file)
-            except OSError as e:  # harmless to the call, but say so in the server log
-                sys.stderr.write("warning: cannot remove %s: %s\n" % (schema_file, e))
+        start, error = sandbox_start(sandbox, run_dir, env)
+        if error is None and os.path.realpath(start) != os.path.realpath(run_dir):
+            error = ("cwd is not visible inside the %s sandbox: a shell there starts in %s, "
+                     "not %s, so Codex would work on the wrong folder. Use a folder the sandbox "
+                     "shows, or workspace-write, which mounts cwd."
+                     % (sandbox, os.path.realpath(start), run_dir))
+        if error is not None:
+            return refuse(error)
+
+        top = git(run_dir, "rev-parse", "--show-toplevel")
+        top = top.strip() if top else None
+        if top is None:
+            basis = "unknown: not a git repo"
+        elif worktree:
+            basis = "git-snapshot (isolated worktree)"
+        else:
+            basis = "git-snapshot (shared tree: includes any other writer during the run)"
+        before = snapshot(top) if top else None
+
+        cmd = [CODEX_BIN, "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+               "-c", 'sandbox_mode="%s"' % sandbox, "-C", run_dir]
+        if model:
+            cmd += ["-m", model]
+        schema_file = None
+        if report_kind:
+            fd, schema_file = tempfile.mkstemp(prefix="codex-report-", suffix=".json")
+            with os.fdopen(fd, "w") as f:
+                json.dump(REPORTS[report_kind], f)
+            cmd += ["--output-schema", schema_file]
+        cmd += ["--", prompt]
+
+        t0 = time.monotonic()
+        error, out, err, rc = None, "", "", None
+        try:
+            with SLOTS:
+                if CANCEL.is_set():  # queued behind another call when the client left
+                    return refuse("cancelled before codex started: the client closed "
+                                  "the connection")
+                started = True
+                try:
+                    rc, out, err, why = run_tracked(cmd, run_dir, env)
+                except NotStarted as e:
+                    return refuse("could not start codex (%s): %s" % (CODEX_BIN, e))
+                if why == "cancelled":
+                    error = "cancelled mid-run: the client closed the connection"
+                elif why == "timeout":
+                    error = "codex timed out after %gs" % TIMEOUT
+        finally:
+            if schema_file:
+                try:
+                    os.remove(schema_file)
+                except OSError as e:  # harmless to the call, but say so in the server log
+                    sys.stderr.write("warning: cannot remove %s: %s\n" % (schema_file, e))
+    except BaseException:  # an error before codex started: nothing in the worktree to keep
+        if worktree and not started:
+            cleanup = remove_worktree(cwd, worktree)
+            if cleanup:
+                sys.stderr.write("warning: the new worktree %s is left behind: %s\n"
+                                 % (worktree["path"], cleanup))
+        raise
     duration = round(time.monotonic() - t0, 1)
 
     messages, events_err, commands, usage, thread, unparsed = [], [], [], None, None, []

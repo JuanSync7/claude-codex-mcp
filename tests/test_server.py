@@ -1,5 +1,6 @@
 """Drives server.py over stdio against a fake codex. Run: python3.12 -m unittest test_server"""
 
+import importlib.util
 import json
 import os
 import socket
@@ -8,8 +9,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER = os.path.join(os.path.dirname(HERE), "codex_mcp", "server.py")
@@ -503,17 +506,6 @@ class ServerTest(unittest.TestCase):
                               .splitlines() if l.startswith("worktree ")]), 1)
         self.assertEqual(git(repo, "branch", "--list", "codex/*"), "")
 
-    def test_queued_worktree_call_cancelled_before_codex_removes_its_worktree(self):
-        repo = self.make_repo()
-        p, err = self.close_mid_call(2, args={"cwd": repo, "worktree": True},
-                                     CODEX_MCP_MAX_PARALLEL="1")
-        self.assert_exit_line(err, 1, "FAILED", "2 call(s) running; cancelled")
-        self.assertIn("cancelled before codex started", self.last_out)
-        # the main tree, and the worktree of the call whose codex started (kept for review)
-        self.assertEqual(len([l for l in git(repo, "worktree", "list", "--porcelain")
-                              .splitlines() if l.startswith("worktree ")]), 2)
-        self.assertEqual(len(git(repo, "branch", "--list", "codex/*").splitlines()), 1)
-
     def test_folder_name_with_edge_spaces_is_matched_exactly(self):
         work = os.path.join(self.tmp.name, " work ")
         os.mkdir(work)
@@ -550,6 +542,70 @@ class ServerTest(unittest.TestCase):
                               CODEX_MCP_LOG=os.path.join(self.tmp.name, "no", "such", "x.jsonl"))
         self.assertFalse(err, body)  # Codex already ran; its answer still comes back
         self.assertTrue(body["log_error"])
+
+
+class PreStartTest(unittest.TestCase):
+    """run_codex in this process, so a test can stop a call at one exact point before codex
+    starts; over stdio the moment a cancel lands cannot be chosen."""
+    tearDown, make_repo = ServerTest.tearDown, ServerTest.make_repo  # the same fake and repo
+
+    def setUp(self):
+        ServerTest.setUp(self)
+        spec = importlib.util.spec_from_file_location("server_under_test", SERVER)
+        self.server = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.server)  # a fresh module: its own CANCEL and SLOTS
+        self.server.CODEX_BIN, self.server.LOG_PATH = self.fake, self.runlog
+        self.server.DEFAULT_SANDBOX, self.server.TIMEOUT = "workspace-write", 30
+        self.server.SLOTS = threading.Semaphore(1)
+        environ = mock.patch.dict(os.environ, FAKE_LOG=self.log, FAKE_MODE="sleep")
+        environ.start()
+        self.addCleanup(environ.stop)
+        self.repo = self.make_repo()
+
+    def run_in_worktree(self):
+        return self.server.run_codex({"prompt": "x", "cwd": self.repo, "worktree": True})
+
+    def worktrees(self):
+        return (len([l for l in git(self.repo, "worktree", "list", "--porcelain").splitlines()
+                     if l.startswith("worktree ")]),
+                len(git(self.repo, "branch", "--list", "codex/*").splitlines()))
+
+    def test_cancel_while_queued_for_a_slot_removes_the_worktree(self):
+        real = self.server.sandbox_start
+
+        def then_cancel(*a):  # the check passed; the client leaves before a slot is free
+            result = real(*a)
+            self.server.CANCEL.set()
+            return result
+
+        with mock.patch.object(self.server, "sandbox_start", then_cancel):
+            res = self.run_in_worktree()
+        self.assertTrue(res["isError"])
+        self.assertIn("cancelled before codex started", res["content"][0]["text"])
+        self.assertFalse(os.path.exists(self.log))  # codex itself never ran
+        self.assertEqual(self.worktrees(), (1, 0))
+
+    def test_error_before_codex_starts_removes_the_worktree(self):
+        with mock.patch.object(self.server, "snapshot", side_effect=RuntimeError("git status")):
+            with self.assertRaises(RuntimeError):
+                self.run_in_worktree()
+        self.assertEqual(self.worktrees(), (1, 0))
+
+    def test_error_after_codex_starts_keeps_the_worktree(self):
+        self.server.TIMEOUT = 0.5
+        pids, killpg = [], os.killpg
+
+        def refuse_kill(pid, sig):  # an error raised by the running call, not by its start
+            pids.append(pid)
+            raise PermissionError("kill refused")
+
+        with mock.patch.object(self.server.os, "killpg", refuse_kill):
+            with self.assertRaises(PermissionError):
+                self.run_in_worktree()
+        for pid in pids:
+            killpg(pid, 9)
+        self.assertTrue(os.path.exists(self.log))  # codex ran
+        self.assertEqual(self.worktrees(), (2, 1))  # what it may have changed is kept
 
 
 if __name__ == "__main__":
