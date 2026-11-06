@@ -599,11 +599,17 @@ class PreStartTest(unittest.TestCase):
             pids.append(pid)
             raise PermissionError("kill refused")
 
+        def kill_fakes():  # also when the test fails, so no fake outlives it
+            for pid in pids:
+                try:
+                    killpg(pid, 9)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(kill_fakes)
         with mock.patch.object(self.server.os, "killpg", refuse_kill):
             with self.assertRaises(PermissionError):
                 self.run_in_worktree()
-        for pid in pids:
-            killpg(pid, 9)
         self.assertTrue(os.path.exists(self.log))  # codex ran
         self.assertEqual(self.worktrees(), (2, 1))  # what it may have changed is kept
 
