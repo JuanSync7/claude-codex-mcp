@@ -327,12 +327,15 @@ def run_codex(args):
                  "so Codex would work on the wrong folder. Use a folder the sandbox shows, "
                  "or workspace-write, which mounts cwd." % (sandbox, os.path.realpath(start),
                                                             run_dir))
-    if error is not None:
+    def refuse(error):  # codex never ran: undo the worktree made for it
         if worktree:
             cleanup = remove_worktree(cwd, worktree)
             if cleanup:
                 error += "; the new worktree %s is left behind: %s" % (worktree["path"], cleanup)
         return tool_result(error, True)
+
+    if error is not None:
+        return refuse(error)
 
     top = git(run_dir, "rev-parse", "--show-toplevel")
     top = top.strip() if top else None
@@ -361,12 +364,12 @@ def run_codex(args):
     try:
         with SLOTS:
             if CANCEL.is_set():  # queued behind another call when the client left
-                return tool_result("cancelled before codex started: the client closed "
-                                   "the connection", True)
+                return refuse("cancelled before codex started: the client closed "
+                              "the connection")
             try:
                 rc, out, err, why = run_tracked(cmd, run_dir, env)
             except OSError as e:
-                return tool_result("could not start codex (%s): %s" % (CODEX_BIN, e), True)
+                return refuse("could not start codex (%s): %s" % (CODEX_BIN, e))
             if why == "cancelled":
                 error = "cancelled mid-run: the client closed the connection"
             elif why == "timeout":

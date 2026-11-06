@@ -503,6 +503,17 @@ class ServerTest(unittest.TestCase):
                               .splitlines() if l.startswith("worktree ")]), 1)
         self.assertEqual(git(repo, "branch", "--list", "codex/*"), "")
 
+    def test_queued_worktree_call_cancelled_before_codex_removes_its_worktree(self):
+        repo = self.make_repo()
+        p, err = self.close_mid_call(2, args={"cwd": repo, "worktree": True},
+                                     CODEX_MCP_MAX_PARALLEL="1")
+        self.assert_exit_line(err, 1, "FAILED", "2 call(s) running; cancelled")
+        self.assertIn("cancelled before codex started", self.last_out)
+        # the main tree, and the worktree of the call whose codex started (kept for review)
+        self.assertEqual(len([l for l in git(repo, "worktree", "list", "--porcelain")
+                              .splitlines() if l.startswith("worktree ")]), 2)
+        self.assertEqual(len(git(repo, "branch", "--list", "codex/*").splitlines()), 1)
+
     def test_folder_name_with_edge_spaces_is_matched_exactly(self):
         work = os.path.join(self.tmp.name, " work ")
         os.mkdir(work)
